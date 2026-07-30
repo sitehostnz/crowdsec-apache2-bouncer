@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# Stop and disable the service before removal, if it was ever enabled/started.
+if [ -d /run/systemd/system ]; then
+    systemctl stop crowdsec-apache2-bouncer >/dev/null 2>&1 || true
+    systemctl disable crowdsec-apache2-bouncer >/dev/null 2>&1 || true
+fi
+
+exit 0

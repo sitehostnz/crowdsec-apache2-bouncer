@@ -1,0 +1,120 @@
+name: release
+
+# Build the release artifacts - a static amd64 binary, a .deb and an .rpm - and
+# attach them to the GitHub Release when a v* tag is pushed. A manual run
+# (workflow_dispatch) builds the same artifacts and uploads them to the workflow
+# run for testing, without creating a Release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # create the Release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      # Gate the release on a green test run - never ship a broken binary.
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.0" >> "$GITHUB_OUTPUT"
+          fi
+
+      # CGO_ENABLED=0 => a truly static binary that runs on older cPanel/Plesk
+      # glibc (a default build links against the runner's glibc; see the README).
+      - name: Build static binary
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -ldflags='-s -w' -o crowdsec-apache2-bouncer .
+          file crowdsec-apache2-bouncer
+          go version -m crowdsec-apache2-bouncer | sed -n '1,3p'
+
+      # fpm builds the .deb/.rpm; the rpm tooling is needed for the .rpm.
+      - name: Install fpm and rpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+
+      - name: Package (.deb, .rpm, raw binary)
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          ITERATION: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          echo "packaging crowdsec-apache2-bouncer ${VERSION}-${ITERATION} (${GITHUB_SHA:0:7})"
+
+          # Stage the install tree (binary -> /usr/local/bin to match the unit).
+          mkdir -p pkgroot/usr/local/bin pkgroot/lib/systemd/system \
+                   pkgroot/etc/crowdsec/bouncers \
+                   pkgroot/usr/share/doc/crowdsec-apache2-bouncer/apache
+          install -m 0755 crowdsec-apache2-bouncer                   pkgroot/usr/local/bin/crowdsec-apache2-bouncer
+          install -m 0644 packaging/crowdsec-apache2-bouncer.service pkgroot/lib/systemd/system/crowdsec-apache2-bouncer.service
+          install -m 0600 packaging/crowdsec-apache2-bouncer.conf    pkgroot/etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf
+          install -m 0644 apache/blocklist.conf                     pkgroot/usr/share/doc/crowdsec-apache2-bouncer/apache/blocklist.conf
+          install -m 0644 README.md                                 pkgroot/usr/share/doc/crowdsec-apache2-bouncer/README.md
+          install -m 0644 CHANGELOG.md                              pkgroot/usr/share/doc/crowdsec-apache2-bouncer/CHANGELOG.md
+
+          mkdir -p dist
+          # The raw static binary alongside the packages.
+          cp crowdsec-apache2-bouncer "dist/crowdsec-apache2-bouncer-${VERSION}-linux-amd64"
+
+          # httxt2dbm ships in apache2-utils (Debian) / httpd-tools (RHEL) - the
+          # package name differs per family, so declare the right dep for each.
+          build_pkg() {
+            fpm -s dir -t "$1" -a "$2" --depends "$3" -f \
+              -n crowdsec-apache2-bouncer -v "$VERSION" --iteration "$ITERATION" \
+              --maintainer "SiteHost <opensource@sitehost.nz>" \
+              --description "Stream-mode CrowdSec bouncer rendering the ban list to an Apache RewriteMap (DBM/txt) for cPanel/Plesk origins." \
+              --url "https://github.com/sitehostnz/crowdsec-apache2-bouncer" \
+              --license "Apache-2.0" \
+              --config-files /etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf \
+              --after-install "$GITHUB_WORKSPACE/packaging/postinst" \
+              --before-remove "$GITHUB_WORKSPACE/packaging/prerm" \
+              --after-remove "$GITHUB_WORKSPACE/packaging/postrm" \
+              -C pkgroot .
+          }
+          build_pkg deb amd64  apache2-utils
+          build_pkg rpm x86_64 httpd-tools
+          mv -- *.deb *.rpm dist/
+          ls -l dist/
+
+      - name: Publish to the GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              dist/*
+          fi
+
+      - name: Upload artifacts (manual run)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: crowdsec-apache2-bouncer-dist
+          path: dist/

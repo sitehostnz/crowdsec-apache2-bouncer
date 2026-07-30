@@ -1,0 +1,41 @@
+# golangci-lint v2 config for crowdsec-apache2-bouncer.
+# Run:  golangci-lint run
+#
+# Spelling is checked against UK English (closest locale misspell offers to
+# NZ English), so "canonicalised"/"behaviour" pass and US spellings are flagged.
+version: "2"
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - misspell    # UK/NZ spelling in comments and strings
+    - gosec       # security smells (subprocess, TLS, file perms)
+    - gocritic    # opinionated correctness/style checks
+    - revive      # style: naming, comments, exported docs
+    - errorlint   # %w wrapping + errors.Is/As misuse
+    - bodyclose   # http response bodies must be closed
+    - noctx       # http requests must carry a context
+    - unconvert   # redundant conversions
+    - unparam     # unused function parameters
+    - copyloopvar # go1.22+ loop-var copies that are no longer needed
+    - nilerr      # returning nil after a non-nil error check
+    - prealloc    # slices that could be preallocated
+  settings:
+    misspell:
+      locale: UK
+    gosec:
+      excludes:
+        - G304 # file paths come from operator config (CA_BUNDLE, OUTPUT_FILE) by design
+  exclusions:
+    rules:
+      # Tests write executable stub scripts (0755) and fixture files on purpose;
+      # gosec's file-permission rules aren't meaningful there.
+      - path: _test\.go
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

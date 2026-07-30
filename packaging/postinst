@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# Reload systemd so it sees the newly installed unit (only when systemd is up).
+if [ "$1" = "configure" ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+# The service is intentionally NOT enabled or started on install: the shipped
+# /etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf carries a placeholder API
+# key, so a fresh install would only crash-loop. Set CROWDSEC_LAPI_URL and
+# CROWDSEC_API_KEY there, then:
+#     systemctl enable --now crowdsec-apache2-bouncer
+
+exit 0
