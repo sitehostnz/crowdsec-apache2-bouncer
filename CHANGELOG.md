@@ -44,7 +44,7 @@ an Apache `RewriteMap`, so banned traffic is turned away by Apache itself.
   a `-dir` flag to put the map files somewhere else. ([#1])
 - A hardened `systemd` unit and a ready-to-include Apache snippet. ([#1])
 - README covering installation, cPanel and Plesk integration, getting the real
-  client IP behind a CDN, performance notes and troubleshooting. ([#1])
+  client IP behind a CDN, and performance notes. ([#1])
 - `.deb` and `.rpm` packages and a static binary, built and attached to each GitHub
   release automatically. ([#1])
 - A benchmark suite covering the paths that run on every update. ([#1])

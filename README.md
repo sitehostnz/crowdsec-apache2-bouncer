@@ -145,39 +145,6 @@ the hostname only proves the server-context half.
 *Additional Apache directives* or a `vhost.conf` template. Then
 `plesk sbin httpdmng --reconfigure-all`.
 
-### Troubleshooting: banned IP still gets 200
-
-Bisect with two curls from the banned IP — hostname (server context) vs customer
-domain (vhost) — then:
-
-| Symptom | Cause / fix |
-|---|---|
-| `httpd -t` fails on RewriteMap | map file missing — start the bouncer first (see below) |
-| hostname 403, customer domain 200 | inheritance didn't land — re-check step 2/3 counts |
-| both 200, IP in `blocklist.txt` | check the **DBM**, not the txt — see the Perl probe below |
-| access log shows a different client IP | you're testing through the CDN — `%{REMOTE_ADDR}` is the edge (see *Real client IP*) |
-| trace shows `lookup OK … val=1` but 200 | a vhost `[L]` rule runs first — you used `Inherit`; switch to `InheritBefore` |
-| no rewrite activity at all | httpd not restarted since the rebuild (`systemctl status httpd` vs config mtime) |
-
-Watch the decision live with `LogLevel info rewrite:trace2` (temporarily — noisy),
-then `grep crowdsec /etc/apache2/logs/error_log`: a
-`map lookup OK: map=crowdsec[dbm] key=<ip> -> val=1` line followed by `forbidding`
-proves the whole chain.
-
-Probe the **DBM's actual contents** (Apache reads it, not the txt; Perl core speaks
-SDBM):
-
-```bash
-perl -MSDBM_File -MFcntl -e '
-  tie %h, "SDBM_File", "/var/lib/crowdsec-apache2-bouncer/blocklist.dbm", O_RDONLY, 0666 or die "tie: $!\n";
-  print exists $h{"<test-ip>"} ? "FOUND\n" : "MISSING\n";
-  print scalar(keys %h), " keys\n"'
-wc -l /var/lib/crowdsec-apache2-bouncer/blocklist.txt      # key count should match line count
-```
-
-`MISSING` / a short key count = the DBM build is truncating (SDBM has size limits) —
-switch producer and consumer to another backend (`httxt2dbm -f DB` + `dbm=db:`).
-
 ### Custom blocked page, status code, and logging
 
 **Blocked page** — `ErrorDocument` takes a **URL-path, not a filesystem path**, and
@@ -348,8 +315,6 @@ grep <your-test-ip> /var/lib/crowdsec-apache2-bouncer/blocklist.txt
 curl -sk -o /dev/null -w '%{http_code}\n' https://<customer-domain>/   # from that IP: 403/429
 cscli decisions delete --ip <your-test-ip>
 ```
-
-If the curl says 200, work through *Troubleshooting: banned IP still gets 200* above.
 
 ## Security
 
