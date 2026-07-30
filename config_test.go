@@ -84,7 +84,7 @@ func TestLoadConfig(t *testing.T) {
 		}
 		if cfg.lapiURL != "http://127.0.0.1:8080" ||
 			cfg.outputFile != "/var/lib/crowdsec-apache2-bouncer/blocklist.txt" ||
-			cfg.updateFrequency != 10*time.Second ||
+			cfg.updateFrequency != 60*time.Second ||
 			cfg.expandMaxHosts != 65536 ||
 			!cfg.onlyBan ||
 			cfg.resyncInterval != 21600*time.Second ||
@@ -204,6 +204,30 @@ func TestLoadConfig(t *testing.T) {
 			t.Fatalf("customListDir = %q", cfg.customListDir)
 		}
 	})
+}
+
+// RESYNC_INTERVAL is either off (0) or a real interval between an hour and a day -
+// a full snapshot is the expensive query, so neither extreme is worth honouring.
+func TestResyncEvery(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		secs int
+		want time.Duration
+	}{
+		{"0 disables", 0, 0},
+		{"negative disables rather than clamping up", -21600, 0},
+		{"the default is left alone", 21600, 6 * time.Hour},
+		{"the lower bound is honoured exactly", 3600, time.Hour},
+		{"the upper bound is honoured exactly", 86400, 24 * time.Hour},
+		{"too frequent clamps up to an hour", 60, time.Hour},
+		{"too rare clamps down to a day", 604800, 24 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resyncEvery(tc.secs); got != tc.want {
+				t.Errorf("resyncEvery(%d) = %s, want %s", tc.secs, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestNewBouncerTLSConfig(t *testing.T) {

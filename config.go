@@ -15,6 +15,15 @@ import (
 // overflow time.Duration (int64 ns). 10 years is far beyond any real setting.
 const maxDurationSecs = 315360000
 
+// Bounds for RESYNC_INTERVAL. A full snapshot is the expensive LAPI query, and the
+// stream deltas already keep the list current between re-syncs - so hourly is as
+// often as it is worth paying for, and a day is as long as cursor drift should go
+// unnoticed. 0 opts out of the safety net entirely.
+const (
+	minResyncSecs = 3600  // 1 hour
+	maxResyncSecs = 86400 // 24 hours
+)
+
 // config holds the runtime configuration, populated from the environment and the
 // -dir flag by loadConfig.
 type config struct {
@@ -99,10 +108,10 @@ func loadConfig() (*config, error) {
 		lapiURL:         strings.TrimRight(envStr("CROWDSEC_LAPI_URL", "http://127.0.0.1:8080"), "/"),
 		apiKey:          envStr("CROWDSEC_API_KEY", ""),
 		outputFile:      envStr("OUTPUT_FILE", filepath.Join(dir, "blocklist.txt")),
-		updateFrequency: time.Duration(min(maxDurationSecs, max(1, envInt("UPDATE_FREQUENCY", 10)))) * time.Second,
+		updateFrequency: time.Duration(min(maxDurationSecs, max(1, envInt("UPDATE_FREQUENCY", 60)))) * time.Second,
 		expandMaxHosts:  uint64(min(1<<20, max(1, envInt("EXPAND_MAX_HOSTS", 65536)))),
 		onlyBan:         envBool("ONLY_BAN", true),
-		resyncInterval:  time.Duration(min(maxDurationSecs, envInt("RESYNC_INTERVAL", 21600))) * time.Second,
+		resyncInterval:  resyncEvery(envInt("RESYNC_INTERVAL", 21600)),
 		requestTimeout:  time.Duration(min(maxDurationSecs, max(1, envInt("REQUEST_TIMEOUT", 10)))) * time.Second,
 		// STREAM_REQUEST_TIMEOUT: the whole-query deadline for the decision stream
 		// (the startup snapshot can be large), separate from the connect timeout.
@@ -135,6 +144,23 @@ func loadConfig() (*config, error) {
 		cfg.requestTimeout = cfg.streamRequestTimeout
 	}
 	return cfg, nil
+}
+
+// resyncEvery turns a RESYNC_INTERVAL seconds value into an interval: 0 or less
+// disables the periodic full re-sync, and anything else is held to [1h, 24h]. An
+// out-of-range value is honoured at the nearest bound rather than rejected, so a
+// bad setting can't stop the daemon starting - but it says so, because otherwise
+// the interval in the logs wouldn't be the one that was configured.
+func resyncEvery(secs int) time.Duration {
+	if secs <= 0 {
+		return 0 // disabled
+	}
+	clamped := min(maxResyncSecs, max(minResyncSecs, secs))
+	if clamped != secs {
+		log.Printf("RESYNC_INTERVAL (%ds) out of range; using %ds (0 disables, otherwise %d-%ds)",
+			secs, clamped, minResyncSecs, maxResyncSecs)
+	}
+	return time.Duration(clamped) * time.Second
 }
 
 // defaultDBMPath derives the DBM path from the txt output path, swapping a

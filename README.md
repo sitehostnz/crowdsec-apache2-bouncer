@@ -343,7 +343,7 @@ Crucially, the lookup cost differs:
 wc -l /var/lib/crowdsec-apache2-bouncer/blocklist.txt          # grows after startup
 systemctl status crowdsec-apache2-bouncer
 # end-to-end: ban yourself, confirm the block on a CUSTOMER domain, then remove
-cscli decisions add --ip <your-test-ip> -d 5m && sleep "${UPDATE_FREQUENCY:-10}"
+cscli decisions add --ip <your-test-ip> -d 5m && sleep "${UPDATE_FREQUENCY:-60}"
 grep <your-test-ip> /var/lib/crowdsec-apache2-bouncer/blocklist.txt
 curl -sk -o /dev/null -w '%{http_code}\n' https://<customer-domain>/   # from that IP: 403/429
 cscli decisions delete --ip <your-test-ip>
