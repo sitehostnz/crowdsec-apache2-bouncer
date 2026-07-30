@@ -32,10 +32,15 @@ func (b *bouncer) included(d decision) bool {
 	return scope == "ip" || scope == "range"
 }
 
-// expand turns one decision into the set of RewriteMap keys it contributes.
-// Single IPs are canonicalised (RFC 5952, IPv4-mapped unwrapped) so the key
-// byte-matches Apache's %{REMOTE_ADDR}. Ranges are enumerated up to the cap.
-func (b *bouncer) expand(d decision) map[string]struct{} {
+// expand turns one decision into the RewriteMap keys it contributes, in a stable
+// order. It returns a slice rather than a set because a walk over a prefix can't
+// repeat an address, so there is nothing to deduplicate - and the overwhelmingly
+// common single-IP decision then costs one string header instead of a whole map
+// (roughly 260 bytes per decision, which at six-figure lists is most of the
+// daemon's heap). Single IPs are canonicalised (RFC 5952, IPv4-mapped unwrapped)
+// so the key byte-matches Apache's %{REMOTE_ADDR}. Ranges are enumerated up to
+// the cap.
+func (b *bouncer) expand(d decision) []string {
 	value := strings.TrimSpace(d.Value)
 	if value == "" {
 		return nil
@@ -47,7 +52,7 @@ func (b *bouncer) expand(d decision) map[string]struct{} {
 			log.Printf("skip invalid ip %q: %v", value, err)
 			return nil
 		}
-		return map[string]struct{}{addr.Unmap().String(): {}}
+		return []string{addr.Unmap().String()}
 	case "range":
 		prefix, err := netip.ParsePrefix(value)
 		if err != nil {
@@ -62,9 +67,9 @@ func (b *bouncer) expand(d decision) map[string]struct{} {
 				value, hostBits, b.cfg.expandMaxHosts)
 			return nil
 		}
-		ips := make(map[string]struct{}, uint64(1)<<hostBits)
+		ips := make([]string, 0, uint64(1)<<hostBits)
 		for addr := prefix.Addr(); prefix.Contains(addr); addr = addr.Next() {
-			ips[addr.Unmap().String()] = struct{}{}
+			ips = append(ips, addr.Unmap().String())
 		}
 		return ips
 	}

@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -43,13 +42,12 @@ func (b *bouncer) writeTxt() error {
 		_ = os.Remove(tmp.Name()) // no-op after successful rename
 	}()
 
-	ips := make([]string, 0, len(b.refcount))
-	for ip := range b.refcount {
-		ips = append(ips, ip)
-	}
-	sort.Strings(ips)
-	w := make([]byte, 0, len(ips)*20)
-	for _, ip := range ips {
+	// sortedIPs is kept in order as the set changes, so there is nothing to
+	// collect or sort here - only the render. One buffer beats streaming through
+	// a bufio.Writer: measured, the extra write syscalls cost more than the
+	// allocation saves.
+	w := make([]byte, 0, len(b.sortedIPs)*20)
+	for _, ip := range b.sortedIPs {
 		w = append(w, ip...)
 		w = append(w, " 1\n"...)
 	}

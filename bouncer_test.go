@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +41,25 @@ func testBouncer(t *testing.T, mutate func(*config)) *bouncer {
 
 func dec(id, scope, value, typ string) decision {
 	return decision{ID: json.Number(id), Scope: scope, Value: value, Type: typ}
+}
+
+// assertSortedInStep checks the invariant the incrementally maintained sortedIPs
+// rests on: it must hold exactly the refcount keyset, in order. Everything the
+// daemon writes to disk comes off this slice, so if it drifts from refcount the
+// map silently stops matching the decisions.
+func assertSortedInStep(t *testing.T, b *bouncer) {
+	t.Helper()
+	if len(b.sortedIPs) != len(b.refcount) {
+		t.Fatalf("sortedIPs has %d entries, refcount has %d", len(b.sortedIPs), len(b.refcount))
+	}
+	if !slices.IsSorted(b.sortedIPs) {
+		t.Fatalf("sortedIPs is not in order: %v", b.sortedIPs)
+	}
+	for _, ip := range b.sortedIPs {
+		if _, ok := b.refcount[ip]; !ok {
+			t.Fatalf("sortedIPs holds %q, which is not in refcount", ip)
+		}
+	}
 }
 
 // ---- expand: canonicalisation + CIDR ----------------------------------------
@@ -79,7 +101,7 @@ func TestExpand(t *testing.T) {
 				t.Fatalf("got %d ips %v, want %d", len(got), got, len(c.want))
 			}
 			for _, ip := range c.want {
-				if _, ok := got[ip]; !ok {
+				if !slices.Contains(got, ip) {
 					t.Fatalf("missing %q in %v", ip, got)
 				}
 			}
@@ -115,6 +137,7 @@ func TestRefcountOverlapAndDelta(t *testing.T) {
 	if len(b.refcount) != 5 {
 		t.Fatalf("want 5 ips after full sync, got %d: %v", len(b.refcount), b.refcount)
 	}
+	assertSortedInStep(t, b)
 
 	// second decision bans the same IP -> refcount 2, but NO new IP appears
 	added, removed = b.applyDelta([]decision{dec("7", "Ip", "203.0.113.9", "ban")}, nil)
@@ -124,6 +147,7 @@ func TestRefcountOverlapAndDelta(t *testing.T) {
 	if b.refcount["203.0.113.9"] != 2 {
 		t.Fatalf("refcount = %d, want 2", b.refcount["203.0.113.9"])
 	}
+	assertSortedInStep(t, b)
 
 	// delete decision 1 -> IP must SURVIVE (still held by 7); delete 2 -> the
 	// range's 4 IPs disappear -> exactly 4 removed
@@ -140,6 +164,7 @@ func TestRefcountOverlapAndDelta(t *testing.T) {
 	if _, ok := b.refcount["10.0.0.1"]; ok {
 		t.Fatal("range ip survived its decision's deletion")
 	}
+	assertSortedInStep(t, b)
 
 	// deleting an unknown decision is a no-op
 	if added, removed = b.applyDelta(nil, []decision{dec("999", "Ip", "8.8.8.8", "ban")}); added != 0 || removed != 0 {
@@ -162,6 +187,7 @@ func TestRefcountOverlapAndDelta(t *testing.T) {
 	if _, ok := b.refcount["198.51.100.7"]; !ok {
 		t.Fatal("new value missing after in-place decision update")
 	}
+	assertSortedInStep(t, b)
 }
 
 func TestApplyFullReportsResyncDiff(t *testing.T) {
@@ -177,6 +203,54 @@ func TestApplyFullReportsResyncDiff(t *testing.T) {
 	})
 	if added != 1 || removed != 1 {
 		t.Fatalf("resync diff = +%d/-%d, want +1/-1", added, removed)
+	}
+	assertSortedInStep(t, b)
+}
+
+// TestApplyDeltaChurnWithinOneTick covers what the incremental counting has to
+// get right and a naive transition counter would not: an IP that leaves one
+// decision and arrives under another in the SAME delta never actually left the
+// blocklist, so it must net to zero.
+func TestApplyDeltaChurnWithinOneTick(t *testing.T) {
+	b := testBouncer(t, nil)
+	b.applyFull([]decision{dec("1", "Ip", "203.0.113.9", "ban")})
+
+	added, removed := b.applyDelta(
+		[]decision{dec("2", "Ip", "203.0.113.9", "ban")},
+		[]decision{dec("1", "Ip", "203.0.113.9", "ban")},
+	)
+	if added != 0 || removed != 0 {
+		t.Fatalf("churn within one tick = +%d/-%d, want +0/-0 (presence unchanged)", added, removed)
+	}
+	if _, ok := b.refcount["203.0.113.9"]; !ok {
+		t.Fatal("203.0.113.9 dropped though decision 2 now holds it")
+	}
+	assertSortedInStep(t, b)
+}
+
+// TestApplyDeltaBulkCrossesResortThreshold exercises settle's rebuild branch: a
+// bulk blocklist import is far more than resortThreshold changes, so sortedIPs
+// is regenerated with one sort instead of spliced change by change.
+func TestApplyDeltaBulkCrossesResortThreshold(t *testing.T) {
+	b := testBouncer(t, nil)
+	bulk := make([]decision, 0, resortThreshold*2)
+	for i := range cap(bulk) {
+		bulk = append(bulk, dec(strconv.Itoa(1000+i), "Ip", fmt.Sprintf("10.%d.%d.1", i/256, i%256), "ban"))
+	}
+
+	added, removed := b.applyDelta(bulk, nil)
+	if added != len(bulk) || removed != 0 {
+		t.Fatalf("bulk import = +%d/-%d, want +%d/-0", added, removed, len(bulk))
+	}
+	assertSortedInStep(t, b)
+
+	added, removed = b.applyDelta(nil, bulk)
+	if added != 0 || removed != len(bulk) {
+		t.Fatalf("bulk removal = +%d/-%d, want +0/-%d", added, removed, len(bulk))
+	}
+	assertSortedInStep(t, b)
+	if len(b.sortedIPs) != 0 {
+		t.Fatalf("sortedIPs still holds %d entries after removing every decision", len(b.sortedIPs))
 	}
 }
 
