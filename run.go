@@ -17,6 +17,11 @@ func (b *bouncer) run(ctx context.Context) {
 	log.Printf("starting: lapi=%s map=%s out=%s freq=%s expand_cap=%d only_ban=%t",
 		b.cfg.lapiURL, b.cfg.mapType, mapOut, b.cfg.updateFrequency, b.cfg.expandMaxHosts, b.cfg.onlyBan)
 
+	// The operator lists don't come from the LAPI, so put them in place before the
+	// first fetch: Apache refuses to start on a missing RewriteMap file, and the
+	// initial sync below can retry for a long time if the LAPI is unreachable.
+	b.syncCustomLists()
+
 	// initial full sync - retry forever; never write an empty file on failure
 	backoff := time.Second
 	for {
@@ -53,6 +58,7 @@ func (b *bouncer) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+		b.syncCustomLists() // independent of the LAPI, so do it even if the poll fails
 		resync := b.cfg.resyncInterval > 0 && time.Since(lastFull) >= b.cfg.resyncInterval
 		sr, err := b.fetch(ctx, resync)
 		if err != nil {

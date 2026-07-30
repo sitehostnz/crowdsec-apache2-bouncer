@@ -28,6 +28,12 @@ ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=-/var/lib/crowdsec-apache2-bouncer
+# The local allowlist/denylist sit under Apache's config directory (CUSTOM_LIST_DIR),
+# and ProtectSystem=full makes /etc read-only to the service - so the directory the
+# daemon maintains has to be listed here. "-" skips a path that isn't present, which
+# is what makes listing both distro layouts safe. The package creates the directory;
+# add your own entry here if you point CUSTOM_LIST_DIR somewhere else under /etc.
+ReadWritePaths=-/etc/apache2/crowdsec -/etc/httpd/crowdsec
 
 [Install]
 WantedBy=multi-user.target

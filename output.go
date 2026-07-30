@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -65,11 +67,21 @@ func (b *bouncer) writeTxt() error {
 	return os.Rename(tmp.Name(), b.cfg.outputFile) // atomic; mtime change -> RewriteMap reload
 }
 
-// buildDBM converts the txt map to a DBM (O(1) lookups) via Apache's httxt2dbm,
-// then moves the generated file(s) into place. Globbing the temp basename
-// handles both single-file (DB/GDBM) and two-file (SDBM .pag/.dir) backends.
+// buildDBM rebuilds the CrowdSec map's DBM. A failure is logged but never fatal.
+// The error says what state the map is in, so it is logged as-is.
 func (b *bouncer) buildDBM() {
-	base := b.cfg.dbmFile
+	if err := b.buildDBMFrom(b.cfg.outputFile, b.cfg.dbmFile); err != nil {
+		log.Printf("%v", err)
+	}
+}
+
+// buildDBMFrom converts the txt map at src into a DBM at dst (O(1) lookups) via
+// Apache's httxt2dbm, then moves the generated file(s) into place. Globbing the
+// temp basename handles both single-file (DB/GDBM) and two-file (SDBM .pag/.dir)
+// backends. On failure dst is left exactly as it was, so a bad conversion never
+// costs Apache the map it already has.
+func (b *bouncer) buildDBMFrom(src, dst string) error {
+	base := dst
 	tmp := base + ".new"
 	if stale, _ := filepath.Glob(tmp + "*"); len(stale) > 0 {
 		for _, f := range stale {
@@ -79,23 +91,25 @@ func (b *bouncer) buildDBM() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	// binary path and file arguments come from operator-owned config
-	// (HTTXT2DBM/OUTPUT_FILE), never from request or decision data.
+	// (HTTXT2DBM/OUTPUT_FILE/CUSTOM_LIST_DIR), never from request or decision data.
 	// #nosec G204
-	out, err := exec.CommandContext(ctx, b.cfg.httxt2dbm, "-i", b.cfg.outputFile, "-o", tmp).CombinedOutput()
+	out, err := exec.CommandContext(ctx, b.cfg.httxt2dbm, "-i", src, "-o", tmp).CombinedOutput()
+	// Nothing has been moved yet on either of these paths, so whatever Apache is
+	// reading is untouched - which is the useful half of the message.
 	if err != nil {
-		log.Printf("httxt2dbm failed (%v): %s; keeping previous DBM", err, strings.TrimSpace(string(out)))
-		return
+		return fmt.Errorf("httxt2dbm %s failed (%w): %s; keeping the previous %s",
+			src, err, strings.TrimSpace(string(out)), dst)
 	}
 	produced, _ := filepath.Glob(tmp + "*")
 	if len(produced) == 0 {
-		log.Printf("httxt2dbm produced no output; keeping previous DBM")
-		return
+		return fmt.Errorf("httxt2dbm produced no output for %s; keeping the previous %s", src, dst)
 	}
 	// NOTE: for two-file backends (SDBM .pag/.dir) this is one rename per file, so
 	// there is a brief window where Apache can read a new .pag with an old .dir.
 	// The window is short and rebuilds are infrequent, and a fully atomic
 	// multi-file swap isn't feasible without hardlink tricks - prefer a single-file
 	// backend (or pin SDBM per the README) if this matters.
+	var swapErrs []error
 	for _, f := range produced {
 		suffix := strings.TrimPrefix(f, tmp) // "" | ".db" | ".pag" | ".dir"
 		// best effort: the converter may have run as another user (e.g. via a
@@ -104,23 +118,30 @@ func (b *bouncer) buildDBM() {
 		// #nosec G302
 		_ = os.Chmod(f, 0o644)
 		if err := os.Rename(f, base+suffix); err != nil {
-			log.Printf("swapping %s into place: %v", f, err)
+			// Past this point some files may already have moved, so the previous map
+			// is NOT necessarily intact - say that rather than reassuring wrongly.
+			swapErrs = append(swapErrs, fmt.Errorf(
+				"swapping %s into place: %w; %s may now be a mix of old and new files", f, err, dst))
 		}
 	}
+	return errors.Join(swapErrs...)
 }
 
-// dbmReady reports whether the DBM map Apache reads actually exists on disk
-// (checking the single-file and two-file backend names). In txt mode there is no
-// DBM, so it is trivially ready. run() uses this on startup so it never logs
-// "startup ok" when buildDBM failed and the map Apache consumes is missing.
-func (b *bouncer) dbmReady() bool {
-	if b.cfg.mapType != "dbm" {
-		return true
-	}
+// dbmPresent reports whether a DBM built at base exists on disk, checking the
+// single-file and two-file backend names.
+func dbmPresent(base string) bool {
 	for _, suffix := range []string{"", ".db", ".pag", ".dir"} {
-		if _, err := os.Stat(b.cfg.dbmFile + suffix); err == nil {
+		if _, err := os.Stat(base + suffix); err == nil {
 			return true
 		}
 	}
 	return false
+}
+
+// dbmReady reports whether the DBM map Apache reads actually exists on disk. In
+// txt mode there is no DBM, so it is trivially ready. run() uses this on startup
+// so it never logs "startup ok" when buildDBM failed and the map Apache consumes
+// is missing.
+func (b *bouncer) dbmReady() bool {
+	return b.cfg.mapType != "dbm" || dbmPresent(b.cfg.dbmFile)
 }

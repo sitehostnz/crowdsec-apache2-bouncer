@@ -32,6 +32,9 @@ type config struct {
 	dbmFile              string
 	insecure             bool
 	caBundle             string
+	// customListDir holds the operator-maintained allowlist/denylist the daemon
+	// creates and keeps DBMs for; empty switches that off.
+	customListDir string
 }
 
 // envStr returns environment variable name, or def when it is unset or empty.
@@ -71,6 +74,16 @@ func envBool(name string, def bool) bool {
 	}
 }
 
+// envOptional returns environment variable name, or def when it is *unset*.
+// Unlike envStr, an explicitly empty value comes back empty rather than falling
+// back to def - which lets an operator write "VAR=" to turn a feature off.
+func envOptional(name, def string) string {
+	if v, ok := os.LookupEnv(name); ok {
+		return strings.TrimSpace(v)
+	}
+	return def
+}
+
 // loadConfig assembles a config from the -dir flag and environment variables,
 // applying defaults. It errors if CROWDSEC_API_KEY is unset, or if MAP_TYPE=dbm
 // but httxt2dbm can't be found.
@@ -98,6 +111,11 @@ func loadConfig() (*config, error) {
 		httxt2dbm:            envStr("HTTXT2DBM", "httxt2dbm"),
 		insecure:             envBool("INSECURE", false),
 		caBundle:             envStr("CA_BUNDLE", ""),
+		// The daemon creates allowlist.txt/denylist.txt here and, in dbm mode,
+		// rebuilds their DBMs when they change. Set CUSTOM_LIST_DIR= (empty) to
+		// leave them alone entirely, or point it elsewhere on RHEL-family layouts
+		// where Apache config lives under /etc/httpd.
+		customListDir: envOptional("CUSTOM_LIST_DIR", "/etc/apache2/crowdsec"),
 	}
 	if cfg.apiKey == "" {
 		return nil, fmt.Errorf("CROWDSEC_API_KEY is required (cscli bouncers add <name>)")

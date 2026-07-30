@@ -6,4 +6,19 @@ if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 
+# On a purge (dpkg passes "purge") or a final uninstall (rpm passes "0"), drop the
+# DBM files the daemon generated from the local lists - they're build artifacts,
+# and nothing else will ever clean them up. The .txt lists are the operator's own
+# content, so they are deliberately left alone; the directory goes only if removing
+# the artifacts leaves it empty.
+case "$1" in
+    purge|0)
+        for dir in /etc/apache2/crowdsec /etc/httpd/crowdsec; do
+            [ -d "$dir" ] || continue
+            rm -f "$dir"/allowlist.dbm* "$dir"/denylist.dbm*
+            rmdir "$dir" 2>/dev/null || true
+        done
+        ;;
+esac
+
 exit 0

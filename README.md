@@ -71,6 +71,11 @@ install -m 0755 crowdsec-apache2-bouncer /usr/local/bin/crowdsec-apache2-bouncer
 # unit + config, as the package would lay them down:
 install -D -m 0600 packaging/crowdsec-apache2-bouncer.conf /etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf
 install -m 0644    packaging/crowdsec-apache2-bouncer.service /etc/systemd/system/
+# Your allowlist/denylist live here (CUSTOM_LIST_DIR; /etc/httpd/crowdsec on
+# RHEL-family Plesk - cPanel uses /etc/apache2 even on RHEL).
+# The package makes this directory; a source install has to, because the unit's
+# ProtectSystem=full leaves /etc read-only to the service.
+install -d -m 0755 /etc/apache2/crowdsec
 cscli bouncers add apache-$(hostname -s)        # the API key (run on the LAPI host)
 $EDITOR /etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf   # set CROWDSEC_LAPI_URL + CROWDSEC_API_KEY
 systemctl daemon-reload && systemctl enable --now crowdsec-apache2-bouncer
@@ -134,8 +139,9 @@ the hostname only proves the server-context half.
 ### Plesk
 
 `/etc/apache2/conf.d/zzz_crowdsec.conf` (Debian/Ubuntu) or
-`/etc/httpd/conf.d/zzz_crowdsec.conf` (RHEL/Alma — also update `BLOCKLIST_DIR` and
-the unit's `ReadWritePaths` if you relocate). Inheritance per vhost via the domain
+`/etc/httpd/conf.d/zzz_crowdsec.conf` (RHEL/Alma — also set
+`CUSTOM_LIST_DIR=/etc/httpd/crowdsec`, and update `BLOCKLIST_DIR` and the unit's
+`ReadWritePaths` if you relocate). Inheritance per vhost via the domain
 *Additional Apache directives* or a `vhost.conf` template. Then
 `plesk sbin httpdmng --reconfigure-all`.
 
@@ -214,15 +220,23 @@ Give the new file a logrotate stanza (`copytruncate`).
 
 ### Allowlist and custom blocklist
 
-The bouncer only manages the CrowdSec map. To **bypass** a block for trusted IPs, or
-to add your **own** manual bans, keep two operator-maintained maps beside it and check
-them in the same include. `RewriteCond`s are AND-ed, so the block fires only when the
-client is *not* allow-listed — the allowlist always wins:
+The bouncer keeps two more lists for you beside the CrowdSec one: an **allowlist**
+that bypasses a block, and your **own blocklist** for manual bans CrowdSec doesn't
+know about. It creates both empty at `/etc/apache2/crowdsec/allowlist.txt` and
+`denylist.txt` (`CUSTOM_LIST_DIR`, which follows Apache's own config directory —
+`/etc/apache2` on Debian/Ubuntu *and* on cPanel, `/etc/httpd` on RHEL-family Plesk;
+the package picks whichever is present at install time), and with
+`MAP_TYPE=dbm` it rebuilds the matching `.dbm` within one poll of you editing either,
+so there's no `httxt2dbm` step to remember. What goes *in* them is entirely yours —
+the daemon only ever creates and converts them, never writes their contents.
+
+Check them in the same include. `RewriteCond`s are AND-ed, so the block fires only
+when the client is *not* allow-listed — the allowlist always wins:
 
 ```apache
 RewriteMap crowdsec    dbm:/var/lib/crowdsec-apache2-bouncer/blocklist.dbm
-RewriteMap local_allow txt:/etc/apache2/crowdsec/allowlist.txt
-RewriteMap local_deny  txt:/etc/apache2/crowdsec/denylist.txt
+RewriteMap local_allow dbm:/etc/apache2/crowdsec/allowlist.dbm
+RewriteMap local_deny  dbm:/etc/apache2/crowdsec/denylist.dbm
 
 # CrowdSec's list, unless allow-listed
 RewriteCond ${local_allow:%{REMOTE_ADDR}|0} !=1
@@ -244,19 +258,24 @@ Both files are `<ip> 1` per line — the same format the bouncer writes, exact-m
 198.51.100.10 1
 ```
 
+- **`txt:` works just as well** — point the maps straight at the `.txt` and an edit is
+  live on the next request, with no rebuild in between. These lists are usually small
+  enough that the `txt` scan below costs nothing; `dbm:` only starts to earn its keep
+  once one runs to thousands of entries.
 - **A couple of IPs, no map** — inline negatives before the block rule instead:
   `RewriteCond %{REMOTE_ADDR} !=203.0.113.5`.
 - **A CIDR range** — a RewriteMap is exact-match only, so use an expression:
   `RewriteCond expr "! (%{REMOTE_ADDR} -ipmatch '203.0.113.0/24')"` before the block's
   `RewriteCond`. `-ipmatch` handles IPv4/IPv6 and CIDR.
-- **`txt` is right here** — hand-maintained lists are small and rarely change, so the
-  O(N) `txt` caveat below doesn't bite, and you skip `httxt2dbm`.
 
 Gotchas: add the allow guard to **every** block rule (the blocked-page variant has its
-own `[F]`); adding a `RewriteMap` directive needs an Apache reload, but editing a map
-file afterwards doesn't (mtime re-read, same as the blocklist); and this is
-**origin-local** — to stop an IP being banned across *all* bouncers, allowlist it in
-CrowdSec itself instead.
+own `[F]`); adding a `RewriteMap` directive needs an Apache reload, but editing a list
+afterwards doesn't (mtime re-read, same as the blocklist — with `dbm:` that happens
+once the daemon has rebuilt it, so within one `UPDATE_FREQUENCY`); this is
+**origin-local**, so to stop an IP being banned across *all* bouncers, allowlist it in
+CrowdSec itself instead; and if you point `CUSTOM_LIST_DIR` at some other directory
+under `/etc`, add it to `ReadWritePaths=` in the unit — `ProtectSystem=full` makes
+`/etc` read-only to the service, so the daemon can't create the files there otherwise.
 
 ### ⚠️ Real client IP
 

@@ -33,6 +33,10 @@ type bouncer struct {
 	// than O(list). applyFull leaves it nil and diffs the two maps directly.
 	touched map[string]bool
 
+	// operator-maintained allow/deny lists kept beside the CrowdSec map; nil when
+	// CUSTOM_LIST_DIR is empty
+	customLists []*customList
+
 	skippedRanges int
 }
 
@@ -70,6 +74,7 @@ func newBouncer(cfg *config) (*bouncer, error) {
 		client:      &http.Client{Transport: transport},
 		decisionIPs: make(map[string][]string),
 		refcount:    make(map[string]int),
+		customLists: newCustomLists(cfg.customListDir),
 	}, nil
 }
 

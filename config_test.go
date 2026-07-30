@@ -19,6 +19,12 @@ func clearEnv(t *testing.T) {
 	} {
 		t.Setenv(v, "")
 	}
+	// CUSTOM_LIST_DIR is read with envOptional, where a set-but-empty value means
+	// "off" rather than "use the default" - so it has to be genuinely unset, not
+	// blanked, or every test below would silently run with the lists disabled.
+	// The t.Setenv first is what registers the cleanup that restores it.
+	t.Setenv("CUSTOM_LIST_DIR", "")
+	_ = os.Unsetenv("CUSTOM_LIST_DIR")
 }
 
 func TestEnvHelpers(t *testing.T) {
@@ -84,6 +90,7 @@ func TestLoadConfig(t *testing.T) {
 			cfg.resyncInterval != 21600*time.Second ||
 			cfg.streamRequestTimeout != 15*time.Second ||
 			cfg.mapType != "txt" ||
+			cfg.customListDir != "/etc/apache2/crowdsec" ||
 			cfg.dbmFile != "/var/lib/crowdsec-apache2-bouncer/blocklist.dbm" {
 			t.Fatalf("unexpected defaults: %+v", cfg)
 		}
@@ -164,6 +171,37 @@ func TestLoadConfig(t *testing.T) {
 		}
 		if cfg.updateFrequency < time.Second || cfg.expandMaxHosts < 1 || cfg.requestTimeout < time.Second || cfg.streamRequestTimeout < time.Second {
 			t.Fatalf("clamps not applied: %+v", cfg)
+		}
+	})
+
+	// CUSTOM_LIST_DIR is the one setting where empty has to mean something other
+	// than "unset", so that an operator can switch the local lists off.
+	t.Run("an explicitly empty CUSTOM_LIST_DIR disables the local lists", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("CROWDSEC_API_KEY", "k")
+		t.Setenv("CUSTOM_LIST_DIR", "")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.customListDir != "" {
+			t.Fatalf("CUSTOM_LIST_DIR= should disable the lists, got %q", cfg.customListDir)
+		}
+		if b, err := newBouncer(cfg); err != nil || b.customLists != nil {
+			t.Fatalf("disabled config still built lists (err=%v)", err)
+		}
+	})
+
+	t.Run("CUSTOM_LIST_DIR is honoured and trimmed", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("CROWDSEC_API_KEY", "k")
+		t.Setenv("CUSTOM_LIST_DIR", "  /etc/httpd/crowdsec  ")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.customListDir != "/etc/httpd/crowdsec" {
+			t.Fatalf("customListDir = %q", cfg.customListDir)
 		}
 	})
 }
