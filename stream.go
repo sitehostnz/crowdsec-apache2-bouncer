@@ -25,7 +25,7 @@ func (b *bouncer) fetch(ctx context.Context, startup bool) (*streamResponse, err
 		return nil, err
 	}
 	req.Header.Set("X-Api-Key", b.cfg.apiKey)
-	req.Header.Set("User-Agent", "crowdsec-apache2-bouncer/1.0")
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := b.client.Do(req)
