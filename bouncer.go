@@ -37,7 +37,45 @@ type bouncer struct {
 	// CUSTOM_LIST_DIR is empty
 	customLists []*customList
 
+	// pendingShrink counts consecutive full snapshots that would have dropped most
+	// of the list; see acceptSnapshot.
+	pendingShrink int
+
 	skippedRanges int
+}
+
+// A full snapshot replaces the list wholesale, so one that arrives short unbans
+// everything it omits. A truncated-but-valid 200 is indistinguishable from a
+// genuine mass-unban at the point of decode - the LAPI can commit a 200 and start
+// writing JSON before it finishes reading its database - so a snapshot that would
+// drop most of the list is treated as suspect rather than authoritative.
+const (
+	// minSnapshotDecisions is the size below which the list is too small for a
+	// proportional test to mean anything: a handful of decisions can legitimately
+	// halve in one interval.
+	minSnapshotDecisions = 50
+	// snapshotShrinkDenom expresses the limit as a fraction: a snapshot holding
+	// fewer than 1/2 of the decisions currently held has to be confirmed.
+	snapshotShrinkDenom = 2
+)
+
+// acceptSnapshot reports whether a full snapshot should be allowed to replace the
+// current list. A big shrink is refused the first time and accepted only if the
+// next snapshot agrees, so a transient LAPI fault costs one resync interval of
+// staleness instead of unbanning everyone. A genuine flush still lands, one
+// interval later.
+func (b *bouncer) acceptSnapshot(incoming int) bool {
+	held := len(b.decisionIPs)
+	if held < minSnapshotDecisions || incoming*snapshotShrinkDenom >= held {
+		b.pendingShrink = 0
+		return true
+	}
+	b.pendingShrink++
+	if b.pendingShrink >= 2 {
+		b.pendingShrink = 0
+		return true // a second snapshot agrees, so the drop is real
+	}
+	return false
 }
 
 // newBouncer constructs a bouncer, wiring the HTTP client's TLS trust from the
@@ -70,8 +108,20 @@ func newBouncer(cfg *config) (*bouncer, error) {
 		transport.TLSClientConfig = tlsCfg
 	}
 	return &bouncer{
-		cfg:         cfg,
-		client:      &http.Client{Transport: transport},
+		cfg: cfg,
+		client: &http.Client{
+			Transport: transport,
+			// Never follow a redirect. Go strips only the Authorization/Cookie
+			// family when a redirect crosses hosts, so the X-Api-Key set in fetch
+			// would be handed verbatim to whatever the target is - and that key
+			// reads the whole decision stream, usually shared across bouncers. The
+			// stream endpoint has no legitimate reason to redirect, so returning
+			// the 3xx unfollowed turns it into a non-200, which lands in the
+			// existing "keep the current list" path.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		decisionIPs: make(map[string][]string),
 		refcount:    make(map[string]int),
 		customLists: newCustomLists(cfg.customListDir),

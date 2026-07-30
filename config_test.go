@@ -192,6 +192,18 @@ func TestLoadConfig(t *testing.T) {
 		}
 	})
 
+	// The DBM is built from the txt map, so one path for both makes the converter
+	// destroy its own input and the two forms flap on every poll.
+	t.Run("DBM_FILE equal to OUTPUT_FILE is rejected", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("CROWDSEC_API_KEY", "k")
+		t.Setenv("OUTPUT_FILE", "/var/lib/crowdsec-apache2-bouncer/blocklist.txt")
+		t.Setenv("DBM_FILE", "/var/lib/crowdsec-apache2-bouncer/blocklist.txt")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("want an error when DBM_FILE and OUTPUT_FILE are the same path")
+		}
+	})
+
 	t.Run("CUSTOM_LIST_DIR is honoured and trimmed", func(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("CROWDSEC_API_KEY", "k")

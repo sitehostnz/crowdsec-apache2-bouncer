@@ -76,11 +76,16 @@ jobs:
           echo "packaging crowdsec-apache2-bouncer ${VERSION}-${ITERATION} (${GITHUB_SHA:0:7})"
 
           # Stage the install tree (binary -> /usr/local/bin to match the unit).
-          mkdir -p pkgroot/usr/local/bin pkgroot/lib/systemd/system \
+          # The unit goes under /usr/lib/systemd/system, NOT /lib: on usr-merged
+          # hosts (RHEL/Alma 8+, Debian bookworm+) /lib is a symlink owned by the
+          # filesystem package, and an RPM claiming it as a directory fails to
+          # install. /usr/lib is in systemd's search path on every distribution, so
+          # one path serves both packages.
+          mkdir -p pkgroot/usr/local/bin pkgroot/usr/lib/systemd/system \
                    pkgroot/etc/crowdsec/bouncers \
                    pkgroot/usr/share/doc/crowdsec-apache2-bouncer/apache
           install -m 0755 crowdsec-apache2-bouncer                   pkgroot/usr/local/bin/crowdsec-apache2-bouncer
-          install -m 0644 packaging/crowdsec-apache2-bouncer.service pkgroot/lib/systemd/system/crowdsec-apache2-bouncer.service
+          install -m 0644 packaging/crowdsec-apache2-bouncer.service pkgroot/usr/lib/systemd/system/crowdsec-apache2-bouncer.service
           install -m 0600 packaging/crowdsec-apache2-bouncer.conf    pkgroot/etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf
           install -m 0644 apache/blocklist.conf                     pkgroot/usr/share/doc/crowdsec-apache2-bouncer/apache/blocklist.conf
           install -m 0644 README.md                                 pkgroot/usr/share/doc/crowdsec-apache2-bouncer/README.md
@@ -90,10 +95,18 @@ jobs:
           # The raw static binary alongside the packages.
           cp crowdsec-apache2-bouncer "dist/crowdsec-apache2-bouncer-${VERSION}-linux-amd64"
 
-          # httxt2dbm ships in apache2-utils (Debian) / httpd-tools (RHEL) - the
-          # package name differs per family, so declare the right dep for each.
+          # httxt2dbm ships in apache2-utils on Debian, so the .deb can name it.
+          # The .rpm deliberately declares NO dependency ($3 empty): cPanel is the
+          # primary RPM target, and EasyApache 4 provides the tool as
+          # ea-apache24-tools while excluding httpd* from its repos - so a hard
+          # "Requires: httpd-tools" makes the package uninstallable there. Nothing
+          # is lost by leaving it to runtime, because loadConfig already fails fast
+          # with a clear message when MAP_TYPE=dbm and the converter is missing.
           build_pkg() {
-            fpm -s dir -t "$1" -a "$2" --depends "$3" -f \
+            depends=""
+            [ -n "$3" ] && depends="--depends $3"
+            # shellcheck disable=SC2086  # depends is deliberately word-split
+            fpm -s dir -t "$1" -a "$2" $depends -f \
               -n crowdsec-apache2-bouncer -v "$VERSION" --iteration "$ITERATION" \
               --maintainer "SiteHost <opensource@sitehost.nz>" \
               --description "Stream-mode CrowdSec bouncer rendering the ban list to an Apache RewriteMap (DBM/txt) for cPanel/Plesk origins." \
@@ -106,7 +119,7 @@ jobs:
               -C pkgroot .
           }
           build_pkg deb amd64  apache2-utils
-          build_pkg rpm x86_64 httpd-tools
+          build_pkg rpm x86_64 ""
           mv -- *.deb *.rpm dist/
           ls -l dist/
 

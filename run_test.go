@@ -274,3 +274,62 @@ func TestRunResync(t *testing.T) {
 		}
 	}
 }
+
+// ---- redirects must not carry the bouncer key onward ---------------------------
+
+// Go strips only the Authorization/Cookie family across a cross-host redirect, so
+// a followed redirect would hand X-Api-Key to the target.
+func TestFetchDoesNotFollowRedirectsOrLeakTheKey(t *testing.T) {
+	var gotKey string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-Api-Key")
+		_, _ = w.Write([]byte(`{"new":[],"deleted":[]}`))
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	b := testBouncer(t, func(c *config) { c.lapiURL = redirector.URL })
+	if _, err := b.fetch(context.Background(), false); err == nil {
+		t.Fatal("a redirect must surface as an error, not be followed")
+	}
+	if gotKey != "" {
+		t.Fatalf("API key was forwarded to the redirect target: %q", gotKey)
+	}
+}
+
+// ---- an empty map must exist before Apache parses its config -------------------
+
+func TestEnsureMapCreatesOnlyWhenAbsent(t *testing.T) {
+	t.Run("creates an empty map when there is none", func(t *testing.T) {
+		b := testBouncer(t, nil)
+		b.ensureMap()
+		info, err := os.Stat(b.cfg.outputFile)
+		if err != nil {
+			t.Fatalf("no map created: %v", err)
+		}
+		if info.Size() != 0 {
+			t.Errorf("want an empty map, got %d bytes", info.Size())
+		}
+	})
+
+	// Overwriting would turn a restart during a LAPI outage into a mass unban.
+	t.Run("never overwrites an existing list", func(t *testing.T) {
+		b := testBouncer(t, nil)
+		want := "203.0.113.9 1\n"
+		if err := os.WriteFile(b.cfg.outputFile, []byte(want), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		b.ensureMap()
+		got, err := os.ReadFile(b.cfg.outputFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Fatalf("existing map was overwritten: %q", got)
+		}
+	})
+}

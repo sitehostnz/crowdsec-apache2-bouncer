@@ -37,8 +37,10 @@ raw `amd64` binary.
 apt-get install -y apache2-utils
 dpkg -i crowdsec-apache2-bouncer_*_amd64.deb
 
-# RHEL/Alma - httpd-tools provides httxt2dbm:
-yum install -y httpd-tools
+# RHEL/Alma - httpd-tools provides httxt2dbm. On cPanel use ea-apache24-tools
+# instead: EasyApache 4 ships the Apache utilities and excludes httpd* from the
+# base repos, so httpd-tools is unavailable there.
+yum install -y httpd-tools        # cPanel: yum install -y ea-apache24-tools
 rpm -i crowdsec-apache2-bouncer-*.x86_64.rpm
 ```
 
@@ -282,7 +284,9 @@ Two findings from the end-to-end test worth knowing at deploy time:
 
 Crucially, the lookup cost differs:
 - **`dbm:` → O(1)** hash lookup, even when the per-mtime cache is cold. Scales to
-  large, frequently-updated lists. **Use this** (default `MAP_TYPE=dbm`).
+  large, frequently-updated lists. **Use this** — the shipped config sets
+  `MAP_TYPE=dbm`, though the built-in default with no config file is `txt`, so set
+  it explicitly if you build from source or run with bare environment variables.
 - **`txt:` → O(N)** linear file scan on every *cold* lookup (new IP, or right after
   the file changed). Since the daemon rewrites the file often, mod_rewrite's cache
   (keyed by mtime) is repeatedly invalidated → recurring O(N) scans. Under **prefork**

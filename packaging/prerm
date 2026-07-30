@@ -1,10 +1,20 @@
 #!/bin/sh
 set -e
 
-# Stop and disable the service before removal, if it was ever enabled/started.
-if [ -d /run/systemd/system ]; then
-    systemctl stop crowdsec-apache2-bouncer >/dev/null 2>&1 || true
-    systemctl disable crowdsec-apache2-bouncer >/dev/null 2>&1 || true
-fi
+# Stop and disable the service ONLY on a genuine removal - never on an upgrade.
+# dpkg calls this as "prerm upgrade <version>" and rpm as "%preun 1" when a newer
+# version replaces this one; disabling there would leave the bouncer switched off
+# after every package upgrade with nothing to turn it back on. That failure is
+# invisible from the outside, because the rendered map stays on disk and Apache
+# keeps serving 403s from a ban list that is no longer being updated.
+#   dpkg: remove | deconfigure        rpm: 0
+case "$1" in
+    remove|deconfigure|0)
+        if [ -d /run/systemd/system ]; then
+            systemctl stop crowdsec-apache2-bouncer >/dev/null 2>&1 || true
+            systemctl disable crowdsec-apache2-bouncer >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
 
 exit 0

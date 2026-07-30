@@ -21,6 +21,7 @@ func (b *bouncer) run(ctx context.Context) {
 	// first fetch: Apache refuses to start on a missing RewriteMap file, and the
 	// initial sync below can retry for a long time if the LAPI is unreachable.
 	b.syncCustomLists()
+	b.ensureMap()
 
 	// initial full sync - retry forever; never write an empty file on failure
 	backoff := time.Second
@@ -67,8 +68,20 @@ func (b *bouncer) run(ctx context.Context) {
 		}
 		switch {
 		case resync:
-			added, removed := b.applyFull(sr.New)
+			if !b.acceptSnapshot(len(sr.New)) {
+				// lastFull is deliberately NOT advanced, so the next tick asks for
+				// another snapshot rather than waiting a whole RESYNC_INTERVAL to
+				// confirm. The list is untouched, so this write still self-heals a
+				// deleted map; only the incoming snapshot is withheld.
+				log.Printf("WARNING: resync returned %d decisions against %d held - refusing to unban that much on a single snapshot; keeping the current list and re-checking on the next poll",
+					len(sr.New), len(b.decisionIPs))
+				if err := b.write(); err != nil {
+					log.Printf("write failed: %v", err)
+				}
+				continue
+			}
 			lastFull = time.Now()
+			added, removed := b.applyFull(sr.New)
 			// always rewrite on resync (self-heals an externally deleted file)
 			if err := b.write(); err != nil {
 				log.Printf("write failed: %v", err)

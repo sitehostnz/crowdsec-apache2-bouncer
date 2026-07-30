@@ -127,6 +127,29 @@ func (b *bouncer) buildDBMFrom(src, dst string) error {
 	return errors.Join(swapErrs...)
 }
 
+// ensureMap writes an empty map, and its DBM, when none exists yet. Apache
+// validates every RewriteMap file as it parses its config and refuses to start if
+// one is missing, and Before=apache2.service does not actually hold the web server
+// back: with Type=simple systemd considers this unit started the moment it execs,
+// while the first snapshot can retry for a long time against an unreachable LAPI.
+// On a boot where the LAPI comes up after Apache, that would take every site on
+// the host down - far worse than a briefly empty ban list.
+//
+// An existing map is left completely alone. Overwriting it would turn a restart
+// during a LAPI outage into a mass unban, which is the failure this is guarding.
+func (b *bouncer) ensureMap() {
+	if _, err := os.Stat(b.cfg.outputFile); err == nil {
+		return
+	}
+	// The set is empty at this point, so this renders an empty map - enough for
+	// Apache to parse its config; the first sync fills it in.
+	if err := b.write(); err != nil {
+		log.Printf("creating an empty map at %s: %v", b.cfg.outputFile, err)
+		return
+	}
+	log.Printf("created an empty map at %s so Apache can parse its config before the first sync", b.cfg.outputFile)
+}
+
 // dbmPresent reports whether a DBM built at base exists on disk, checking the
 // single-file and two-file backend names.
 func dbmPresent(base string) bool {

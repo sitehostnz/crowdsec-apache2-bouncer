@@ -1,8 +1,12 @@
 #!/bin/sh
 set -e
 
-# Reload systemd so it sees the newly installed unit (only when systemd is up).
-if [ "$1" = "configure" ] && [ -d /run/systemd/system ]; then
+# Reload systemd so it sees the newly installed unit. Deliberately not gated on
+# "$1": dpkg passes "configure" but rpm passes an install count (1 on install, 2 on
+# upgrade), so checking for dpkg's convention alone means the reload never happens
+# on RHEL-family hosts - and then the "systemctl enable --now" below fails with
+# "Unit not found". An unconditional reload is idempotent and harmless on both.
+if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 
@@ -27,9 +31,30 @@ if [ "$list_dir" != /etc/apache2/crowdsec ]; then
     echo "crowdsec-apache2-bouncer: set CUSTOM_LIST_DIR=$list_dir in /etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf"
 fi
 
-# The service is intentionally NOT enabled or started on install: the shipped
-# /etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf carries a placeholder API
-# key, so a fresh install would only crash-loop. Set CROWDSEC_LAPI_URL and
+# Same reasoning for the CrowdSec map itself: Apache validates every RewriteMap
+# file when it parses its config and refuses to start if one is missing, so an
+# empty map has to exist before the include can safely be added. Only ever create
+# it - an existing list is left exactly as it is. (The daemon does the same at
+# startup, and builds the DBM there; this covers configuring Apache before the
+# service has ever run.)
+blocklist_dir=/var/lib/crowdsec-apache2-bouncer
+mkdir -p "$blocklist_dir"
+chmod 0755 "$blocklist_dir"
+if [ ! -e "$blocklist_dir/blocklist.txt" ]; then
+    : > "$blocklist_dir/blocklist.txt"
+    chmod 0644 "$blocklist_dir/blocklist.txt"
+fi
+
+# On an upgrade the running daemon is still the old binary, so restart it - but
+# only if it was already enabled, since a fresh install deliberately leaves the
+# service off (see below).
+if [ -d /run/systemd/system ] && systemctl is-enabled --quiet crowdsec-apache2-bouncer 2>/dev/null; then
+    systemctl restart crowdsec-apache2-bouncer >/dev/null 2>&1 || true
+fi
+
+# The service is intentionally NOT enabled or started on a fresh install: the
+# shipped /etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf carries a
+# placeholder API key, so it would only crash-loop. Set CROWDSEC_LAPI_URL and
 # CROWDSEC_API_KEY there, then:
 #     systemctl enable --now crowdsec-apache2-bouncer
 

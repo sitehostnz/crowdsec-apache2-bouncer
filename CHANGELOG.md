@@ -14,7 +14,9 @@ an Apache `RewriteMap`, so banned traffic is turned away by Apache itself.
 ### Added
 
 - Blocks banned addresses at Apache through a `RewriteMap` — the full ban list on
-  startup, then updates every `UPDATE_FREQUENCY` seconds. ([#1])
+  startup, then updates every `UPDATE_FREQUENCY` seconds. An empty map is created
+  before the first sync if none exists, since Apache refuses to start when a
+  `RewriteMap` file is missing; an existing list is never overwritten. ([#1])
 - Optional DBM hash map (`MAP_TYPE=dbm`, what the packages ship with) for
   constant-time lookups on large lists. If a rebuild ever fails the previous map
   stays in place, so the list is never lost. ([#1])
@@ -32,7 +34,9 @@ an Apache `RewriteMap`, so banned traffic is turned away by Apache itself.
 - An address covered by more than one CrowdSec decision stays blocked until the last
   of those decisions expires. ([#1])
 - A periodic full re-sync (`RESYNC_INTERVAL`) as a safety net, which also rebuilds
-  the map if something removes it. ([#1])
+  the map if something removes it. A re-sync that would unban most of the list is
+  held back until a second one agrees, so a momentary LAPI fault can't clear your
+  blocklist. ([#1])
 - Separate timeouts for talking to the LAPI: `REQUEST_TIMEOUT` to fail fast when it
   is unreachable, and `STREAM_REQUEST_TIMEOUT` (15s by default) so a large first
   download isn't cut short. ([#1])

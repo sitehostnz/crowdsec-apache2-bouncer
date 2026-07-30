@@ -470,3 +470,62 @@ func TestEndToEndFileMaintenance(t *testing.T) {
 		t.Fatalf("file = %q, want %q", got, want)
 	}
 }
+
+// ---- full-snapshot shrink guard ------------------------------------------------
+
+// A full snapshot replaces the list wholesale, so a truncated-but-valid 200 would
+// unban everything it omits. A large drop has to be confirmed by a second snapshot.
+func TestAcceptSnapshot(t *testing.T) {
+	held := func(n int) *bouncer {
+		b := testBouncer(t, nil)
+		for i := range n {
+			b.decisionIPs[strconv.Itoa(i)] = []string{"203.0.113.1"}
+		}
+		return b
+	}
+
+	t.Run("a small list is never second-guessed", func(t *testing.T) {
+		b := held(minSnapshotDecisions - 1)
+		if !b.acceptSnapshot(0) {
+			t.Fatal("below the floor a snapshot must be taken at face value")
+		}
+	})
+
+	t.Run("a modest shrink is accepted outright", func(t *testing.T) {
+		b := held(1000)
+		if !b.acceptSnapshot(600) {
+			t.Fatal("600 of 1000 is above the limit and should apply immediately")
+		}
+	})
+
+	t.Run("growth is always accepted", func(t *testing.T) {
+		b := held(1000)
+		if !b.acceptSnapshot(5000) {
+			t.Fatal("a larger snapshot must apply")
+		}
+	})
+
+	t.Run("an empty snapshot is refused once then confirmed", func(t *testing.T) {
+		b := held(1000)
+		if b.acceptSnapshot(0) {
+			t.Fatal("a snapshot wiping the whole list must not apply on first sight")
+		}
+		if !b.acceptSnapshot(0) {
+			t.Fatal("a second agreeing snapshot means the flush is real - it must apply")
+		}
+	})
+
+	t.Run("a recovered snapshot clears the pending state", func(t *testing.T) {
+		b := held(1000)
+		if b.acceptSnapshot(0) {
+			t.Fatal("first short snapshot should be refused")
+		}
+		if !b.acceptSnapshot(1000) { // LAPI recovered
+			t.Fatal("a full snapshot must apply")
+		}
+		// ...so the next short one starts the count again rather than landing.
+		if b.acceptSnapshot(0) {
+			t.Fatal("pending state should have been reset by the good snapshot")
+		}
+	})
+}

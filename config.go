@@ -130,6 +130,12 @@ func loadConfig() (*config, error) {
 		return nil, fmt.Errorf("CROWDSEC_API_KEY is required (cscli bouncers add <name>)")
 	}
 	cfg.dbmFile = envStr("DBM_FILE", defaultDBMPath(cfg.outputFile))
+	// The DBM is built *from* the txt map, so pointing both at one path makes the
+	// converter destroy its own input and the two forms flap on every poll - which
+	// surfaces as blocking that works intermittently for no visible reason.
+	if cfg.dbmFile == cfg.outputFile {
+		return nil, fmt.Errorf("DBM_FILE and OUTPUT_FILE are both %q; the DBM is built from the txt map, so they must differ", cfg.outputFile)
+	}
 	if cfg.mapType == "dbm" {
 		if _, err := exec.LookPath(cfg.httxt2dbm); err != nil {
 			return nil, fmt.Errorf("MAP_TYPE=dbm but %q not found (install apache2-utils / httpd-tools, or set HTTXT2DBM)", cfg.httxt2dbm)
