@@ -1,0 +1,39 @@
+[Unit]
+Description=CrowdSec Apache RewriteMap bouncer (stream mode)
+Documentation=https://docs.crowdsec.net/docs/bouncers/intro
+After=network-online.target
+Wants=network-online.target
+# Start before the web server so the RewriteMap file exists when Apache parses
+# its config (Apache refuses to start if the map is missing). Ordering against a
+# unit that isn't installed is a no-op, so listing both distro names is safe.
+Before=apache2.service httpd.service
+# Give up after 5 failed starts in 60s instead of crash-looping forever on a
+# misconfiguration (bad key, missing httxt2dbm, ...).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf
+ExecStart=/usr/local/bin/crowdsec-apache2-bouncer
+Restart=always
+RestartSec=5
+
+# Hardening. The blocklist lives under /var/lib/crowdsec-apache2-bouncer (BLOCKLIST_DIR /
+# -dir to change); /var stays writable under ProtectSystem=full, and the daemon
+# creates the directory itself. The ReadWritePaths entry ("-" = skip if missing)
+# only matters if you tighten to ProtectSystem=strict or move the dir under /etc.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=-/var/lib/crowdsec-apache2-bouncer
+# The local allowlist/denylist sit under Apache's config directory (CUSTOM_LIST_DIR),
+# and ProtectSystem=full makes /etc read-only to the service - so the directory the
+# daemon maintains has to be listed here. "-" skips a path that isn't present, which
+# is what makes listing both distro layouts safe. The package creates the directory;
+# add your own entry here if you point CUSTOM_LIST_DIR somewhere else under /etc.
+ReadWritePaths=-/etc/apache2/crowdsec -/etc/httpd/crowdsec
+
+[Install]
+WantedBy=multi-user.target
