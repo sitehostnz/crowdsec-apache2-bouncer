@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -190,6 +192,11 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 func TestRunLifecycle(t *testing.T) {
+	var logs bytes.Buffer
+	oldLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldLogWriter)
+
 	lapi := &scriptedLAPI{script: func(call int, w http.ResponseWriter) {
 		switch call {
 		case 1: // startup attempt 1: LAPI down -> must retry, not crash
@@ -209,6 +216,8 @@ func TestRunLifecycle(t *testing.T) {
 		c.lapiURL = srv.URL
 		c.updateFrequency = 25 * time.Millisecond
 		c.resyncInterval = 0 // deltas only
+		c.requestTimeout = 3 * time.Second
+		c.streamRequestTimeout = 7 * time.Second
 	})
 	readFile := func() string {
 		got, _ := os.ReadFile(b.cfg.outputFile)
@@ -244,6 +253,9 @@ func TestRunLifecycle(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("run() did not stop on context cancel")
+	}
+	if !strings.Contains(logs.String(), "freq=25ms req_timeout=3s stream_timeout=7s expand_cap=65536") {
+		t.Fatalf("startup log does not report the effective LAPI timeouts:\n%s", logs.String())
 	}
 }
 

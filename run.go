@@ -14,8 +14,9 @@ func (b *bouncer) run(ctx context.Context) {
 	if b.cfg.mapType == "dbm" {
 		mapOut = b.cfg.dbmFile
 	}
-	log.Printf("starting: lapi=%s map=%s out=%s freq=%s expand_cap=%d only_ban=%t",
-		b.cfg.lapiURL, b.cfg.mapType, mapOut, b.cfg.updateFrequency, b.cfg.expandMaxHosts, b.cfg.onlyBan)
+	log.Printf("starting: lapi=%s map=%s out=%s freq=%s req_timeout=%s stream_timeout=%s expand_cap=%d only_ban=%t",
+		b.cfg.lapiURL, b.cfg.mapType, mapOut, b.cfg.updateFrequency, b.cfg.requestTimeout,
+		b.cfg.streamRequestTimeout, b.cfg.expandMaxHosts, b.cfg.onlyBan)
 
 	// The operator lists don't come from the LAPI, so put them in place before the
 	// first fetch: Apache refuses to start on a missing RewriteMap file, and the
