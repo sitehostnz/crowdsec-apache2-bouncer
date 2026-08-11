@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -13,9 +14,11 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, v := range []string{
 		"CROWDSEC_LAPI_URL", "CROWDSEC_API_KEY", "BLOCKLIST_DIR", "OUTPUT_FILE", "UPDATE_FREQUENCY",
-		"EXPAND_MAX_HOSTS", "ONLY_BAN", "RESYNC_INTERVAL", "REQUEST_TIMEOUT",
+		"EXPAND_MAX_HOSTS", "ONLY_BAN", "BOUNCING_ON_TYPE", "FALLBACK_REMEDIATION", "OVERRIDE_REMEDIATION",
+		"RESYNC_INTERVAL", "REQUEST_TIMEOUT",
 		"MAP_TYPE", "HTTXT2DBM", "DBM_FILE", "INSECURE", "CA_BUNDLE",
-		"STREAM_REQUEST_TIMEOUT",
+		"STREAM_REQUEST_TIMEOUT", "CAPTCHA_LISTEN", "CAPTCHA_VERIFY_URL", "CAPTCHA_SECRET",
+		"CAPTCHA_API_ENDPOINT", "CAPTCHA_PASS_KEY", "CAPTCHA_PASS_FILE",
 	} {
 		t.Setenv(v, "")
 	}
@@ -86,7 +89,7 @@ func TestLoadConfig(t *testing.T) {
 			cfg.outputFile != "/var/lib/crowdsec-apache2-bouncer/blocklist.txt" ||
 			cfg.updateFrequency != 60*time.Second ||
 			cfg.expandMaxHosts != 65536 ||
-			!cfg.onlyBan ||
+			!slices.Equal(cfg.remediations, []string{"ban"}) ||
 			cfg.resyncInterval != 21600*time.Second ||
 			cfg.streamRequestTimeout != 15*time.Second ||
 			cfg.mapType != "txt" ||
@@ -109,7 +112,7 @@ func TestLoadConfig(t *testing.T) {
 		}
 		if cfg.lapiURL != "https://crowdsec.example:8085" ||
 			cfg.updateFrequency != 30*time.Second ||
-			cfg.onlyBan ||
+			!slices.Equal(cfg.remediations, []string{"ban", "captcha"}) ||
 			cfg.dbmFile != "/custom/path.dbm" {
 			t.Fatalf("overrides not applied: %+v", cfg)
 		}
@@ -216,6 +219,160 @@ func TestLoadConfig(t *testing.T) {
 			t.Fatalf("customListDir = %q", cfg.customListDir)
 		}
 	})
+}
+
+// TestResolveRemediation pins the order the nginx bouncer uses: BOUNCING_ON_TYPE
+// filters, then OVERRIDE_REMEDIATION replaces, then FALLBACK_REMEDIATION catches
+// what is left. Getting the order wrong is not cosmetic - override-then-fallback
+// is what makes "challenge everything" degrade to a block when no challenge is
+// configured, instead of silently enforcing nothing.
+func TestResolveRemediation(t *testing.T) {
+	cfg := func(bounce, override, fallback string, captcha bool) *config {
+		c := &config{bouncingOnType: bounce, overrideRemediation: override, fallbackRemediation: fallback}
+		if captcha {
+			c.captchaListen = "127.0.0.1:8125"
+		}
+		return c
+	}
+	cases := []struct {
+		name                      string
+		c                         *config
+		ban, captcha, unsupported string
+	}{
+		{"default: ban only", cfg("ban", "", "ban", false), "ban", "", ""},
+		{"all, no challenge configured: captcha degrades to the fallback",
+			cfg("all", "", "ban", false), "ban", "ban", "ban"},
+		{"all, challenge configured: captcha is honoured",
+			cfg("all", "", "ban", true), "ban", "captcha", "ban"},
+		{"override to captcha with a challenge: everything is challenged",
+			cfg("all", "captcha", "ban", true), "captcha", "captcha", "captcha"},
+		// The case the ordering exists for.
+		{"override to captcha with NO challenge: degrades to the fallback, not silence",
+			cfg("all", "captcha", "ban", false), "ban", "ban", "ban"},
+		{"override to ban: everything is blocked",
+			cfg("all", "ban", "ban", true), "ban", "ban", "ban"},
+		{"no fallback: an unexpressible remediation is dropped",
+			cfg("all", "", "", true), "ban", "captcha", ""},
+		{"no fallback and no challenge: captcha is rendered but unenforced",
+			cfg("all", "", "", false), "ban", "captcha", ""},
+		// BOUNCING_ON_TYPE filters FIRST, so an unexpressible type is dropped before
+		// the fallback is ever consulted.
+		{"bouncing on captcha only: bans and throttles are filtered out",
+			cfg("captcha", "", "ban", true), "", "captcha", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, got := range []struct{ in, want, actual string }{
+				{"ban", c.ban, c.c.resolveRemediation("ban")},
+				{"captcha", c.captcha, c.c.resolveRemediation("captcha")},
+				{"throttle", c.unsupported, c.c.resolveRemediation("throttle")},
+			} {
+				if got.actual != got.want {
+					t.Errorf("%s -> %q, want %q", got.in, got.actual, got.want)
+				}
+			}
+		})
+	}
+}
+
+// The maps rendered are derived from the routing, so a decision can never be sent
+// to a map that was never built.
+func TestMapsNeeded(t *testing.T) {
+	cases := []struct {
+		name string
+		c    *config
+		want []string
+	}{
+		{"default", &config{bouncingOnType: "ban", fallbackRemediation: "ban"}, []string{"ban"}},
+		{"all without a challenge collapses to ban",
+			&config{bouncingOnType: "all", fallbackRemediation: "ban"}, []string{"ban"}},
+		{"all with a challenge needs both",
+			&config{bouncingOnType: "all", fallbackRemediation: "ban", captchaListen: ":1"}, []string{"ban", "captcha"}},
+		{"override to captcha still needs ban for the unexpressible",
+			&config{bouncingOnType: "all", overrideRemediation: "captcha", fallbackRemediation: "ban", captchaListen: ":1"},
+			[]string{"captcha"}},
+		{"captcha only, no fallback",
+			&config{bouncingOnType: "captcha", captchaListen: ":1"}, []string{"captcha"}},
+		// Rendered but enforced by nothing - honest, and warned about at startup.
+		{"captcha with no listener and no fallback", &config{bouncingOnType: "captcha"}, []string{"captcha"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.c.mapsNeeded(); !slices.Equal(got, c.want) {
+				t.Fatalf("mapsNeeded = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestRemediationPolicyEnv(t *testing.T) {
+	t.Run("an unknown BOUNCING_ON_TYPE is fatal", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("CROWDSEC_API_KEY", "k")
+		t.Setenv("BOUNCING_ON_TYPE", "nonsense")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("want an error")
+		}
+	})
+	t.Run("an unknown FALLBACK_REMEDIATION is fatal", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("CROWDSEC_API_KEY", "k")
+		t.Setenv("FALLBACK_REMEDIATION", "nonsense")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("want an error")
+		}
+	})
+	// Empty is meaningful and must not fall back to the default: it switches the
+	// degrade off entirely.
+	t.Run("an explicitly empty FALLBACK_REMEDIATION switches the degrade off", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("CROWDSEC_API_KEY", "k")
+		t.Setenv("BOUNCING_ON_TYPE", "all")
+		t.Setenv("FALLBACK_REMEDIATION", "")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.fallbackRemediation != "" {
+			t.Fatalf("fallback = %q, want empty", cfg.fallbackRemediation)
+		}
+		if got := cfg.resolveRemediation("throttle"); got != "" {
+			t.Fatalf("throttle -> %q, want dropped", got)
+		}
+	})
+	t.Run("ONLY_BAN=false maps onto BOUNCING_ON_TYPE=all", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("CROWDSEC_API_KEY", "k")
+		t.Setenv("ONLY_BAN", "false")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.bouncingOnType != bouncingAll {
+			t.Fatalf("bouncingOnType = %q, want %q", cfg.bouncingOnType, bouncingAll)
+		}
+	})
+}
+
+// TestMapPaths pins the back-compat guarantee: the ban map stays exactly where
+// OUTPUT_FILE/DBM_FILE point, so an upgrade never moves the file the Apache
+// config already names.
+func TestMapPaths(t *testing.T) {
+	c := &config{outputFile: "/var/lib/bouncer/blocklist.txt", dbmFile: "/var/lib/bouncer/blocklist.dbm"}
+	if txt, dbm := c.mapPaths("ban"); txt != c.outputFile || dbm != c.dbmFile {
+		t.Fatalf("ban map moved: txt=%q dbm=%q", txt, dbm)
+	}
+	txt, dbm := c.mapPaths("captcha")
+	if txt != "/var/lib/bouncer/captcha.txt" || dbm != "/var/lib/bouncer/captcha.dbm" {
+		t.Fatalf("captcha map = %q / %q", txt, dbm)
+	}
+
+	// An explicit DBM_FILE elsewhere must not drag the other maps with it - they
+	// follow the txt map's directory, which is the one Apache traverses.
+	c = &config{outputFile: "/var/lib/bouncer/blocklist.txt", dbmFile: "/somewhere/else.dbm"}
+	if txt, _ = c.mapPaths("captcha"); txt != "/var/lib/bouncer/captcha.txt" {
+		t.Fatalf("captcha txt followed DBM_FILE instead of OUTPUT_FILE: %q", txt)
+	}
 }
 
 // RESYNC_INTERVAL is either off (0) or a real interval between an hour and a day -

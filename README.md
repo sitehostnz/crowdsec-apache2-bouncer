@@ -306,7 +306,152 @@ Crucially, the lookup cost differs:
   always skipped. For large-range bans use the `cs-firewall-bouncer` (ipset
   `hash:net`) instead/alongside; ipset does CIDR natively.
 - **Country/AS/username** scoped decisions are skipped (can't map to IPs without geo).
-- Only `type=ban` by default (`ONLY_BAN`).
+- Only `type=ban` by default (`BOUNCING_ON_TYPE`) — see below.
+- **`throttle`** has no `RewriteMap` expression at all and is never enforced.
+
+## Remediations
+
+Three settings decide what happens to a decision. They carry the **same names,
+values and order as the nginx bouncer**, so a fleet running both needs one mental
+model:
+
+| | Values | Default | |
+|---|---|---|---|
+| `BOUNCING_ON_TYPE` | `ban` / `captcha` / `all` | `ban` | Which decisions are acted on at all |
+| `OVERRIDE_REMEDIATION` | `ban` / `captcha` / empty | empty | Replaces whatever the hub asked for |
+| `FALLBACK_REMEDIATION` | `ban` / `captcha` / empty | `ban` | Catches what cannot be expressed |
+
+They apply in that order, and **override runs before fallback** — which is the
+detail that matters. `OVERRIDE_REMEDIATION=captcha` on a box where no challenge is
+configured degrades to `FALLBACK_REMEDIATION` and *blocks*, rather than quietly
+enforcing nothing.
+
+The fallback catches two cases: a remediation Apache can't express (`throttle` has
+no `RewriteMap` form at all), and a `captcha` when `CAPTCHA_LISTEN` is unset. Set
+`FALLBACK_REMEDIATION=` (empty) to drop those decisions instead.
+
+Each reachable remediation renders to its **own** map, because the type decides what
+Apache does with a hit:
+
+| Remediation | Map |
+|---|---|
+| `ban` | `blocklist.txt` / `.dbm` — i.e. `OUTPUT_FILE` / `DBM_FILE` |
+| `captcha` | `captcha.txt` / `.dbm`, in the same directory |
+
+The map set is **derived** from the three settings, so a map exists exactly when
+something can land in it — `OVERRIDE_REMEDIATION=captcha` builds no ban map at all.
+The ban map keeps `OUTPUT_FILE`/`DBM_FILE`, so an existing Apache config still points
+at the right file. A single address can hold a ban *and* a captcha at once, and a
+decision the hub escalates from captcha to ban moves between maps rather than sitting
+in both.
+
+The startup line states the resulting policy outright:
+
+```
+remediation policy: bouncing_on=all override="" fallback="ban" -> ban:ban captcha:captcha throttle:ban
+```
+
+To emit captcha decisions at all you also need a
+[captcha profile](https://docs.crowdsec.net/docs/local_api/profiles/captcha_profile/)
+on the LAPI.
+
+> **`ONLY_BAN` is deprecated** and will be removed. It's read only when
+> `BOUNCING_ON_TYPE` is unset (`true` → `ban`, `false` → `all`) and warns at every
+> start. Note `ONLY_BAN=false` is no longer equivalent: it used to force every
+> decision type into the ban map, where captcha decisions now render to their own
+> and `FALLBACK_REMEDIATION` decides what happens without a challenge.
+
+### The challenge listener
+
+Apache can't run a captcha on its own: `mod_rewrite` has no HTTP client to call a
+provider's `siteverify` with, and nowhere to keep the result. (`RewriteMap prg:` is
+not a way round it — Apache runs one copy for the whole server behind the
+`rewrite-map` mutex, so a network call there blocks every worker.) So the daemon
+serves the challenge itself, on loopback, and Apache proxies to it.
+
+```
+CAPTCHA_LISTEN=127.0.0.1:8125
+CAPTCHA_VERIFY_URL=https://cap.example.net/<site-key>/siteverify
+CAPTCHA_API_ENDPOINT=https://cap.example.net/<site-key>/
+CAPTCHA_SECRET=<secret key>
+```
+
+A challenged client is redirected to the listener, solves the widget, and the
+daemon verifies the token server-to-server before writing them into a **pass map**
+Apache checks ahead of the captcha map. The pass map is a `txt:` map on purpose:
+Apache re-reads it the moment its mtime changes, so a solve takes effect on the
+very next request instead of waiting for a DBM rebuild. It's the one map where the
+latency is user-visible.
+
+> ⚠️ **Bind it to loopback.** The address Apache reports in `X-CrowdSec-Real-IP` is
+> what a pass is recorded against, so a directly reachable listener would let
+> anyone name their own address and exempt it.
+
+**What a pass is keyed on** — `CAPTCHA_PASS_KEY`:
+
+| | Covers | Trade-off |
+|---|---|---|
+| `ip` *(default)* | Every browser at that address, on every vhost on the box | Everyone behind the same NAT is let through by one solver |
+| `cookie` | One browser | Scoped to one domain, so a client re-solves on each vhost |
+
+`ip` is the default because it's what CrowdSec's own nginx bouncer does, and its
+Apache side is a plain map lookup identical to the ban list. `cookie` is the more
+correct answer under NAT.
+
+**Failure behaviour is fail-closed throughout.** A provider that rejects the token,
+errors, returns nonsense, or can't be reached at all leaves the client challenged —
+a captcha outage must never become a free pass for the traffic the hub flagged. A
+pass that can't be written to disk is likewise reported as a failure rather than a
+redirect, so the client isn't bounced into a loop. And passes are discarded when
+the daemon restarts: they live in memory, so a file inherited from a previous run
+would name clients with no expiry and stay valid forever.
+
+### Apache configuration
+
+```apache
+RewriteMap crowdsec dbm:/var/lib/crowdsec-apache2-bouncer/blocklist.dbm
+RewriteMap captcha  dbm:/var/lib/crowdsec-apache2-bouncer/captcha.dbm
+RewriteMap cap_ok   txt:/var/lib/crowdsec-apache2-bouncer/captcha_passed.txt
+
+# The challenge must never be challenged, or a blocked client can't reach the
+# page that would unblock them.
+RewriteCond %{REQUEST_URI} ^/crowdsec-verify
+RewriteRule ^ - [L]
+
+# Already solved? (CAPTCHA_PASS_KEY=ip)
+RewriteCond ${cap_ok:%{REMOTE_ADDR}|0} =1
+RewriteRule ^ - [L]
+#   ...or with CAPTCHA_PASS_KEY=cookie, instead of the two lines above:
+#   RewriteCond %{HTTP_COOKIE} (?:^|;\s*)cs_captcha=([A-Za-z0-9_-]{32}) [NC]
+#   RewriteCond ${cap_ok:%1|0} =1
+#   RewriteRule ^ - [L]
+
+# A ban outranks a captcha: block first, so an address holding both is refused.
+RewriteCond ${crowdsec:%{REMOTE_ADDR}|0} =1
+RewriteRule ^ - [F]
+
+# Challenge HTML navigations only - a redirect on an image request produces a
+# broken page, not a challenge.
+RewriteCond %{HTTP_ACCEPT} text/html
+RewriteCond ${captcha:%{REMOTE_ADDR}|0} =1
+RewriteRule ^ /crowdsec-verify?r=%{REQUEST_URI} [R=302,L,QSA]
+
+# Everything else from a challenged address is simply refused.
+RewriteCond ${captcha:%{REMOTE_ADDR}|0} =1
+RewriteRule ^ - [F]
+
+ProxyPass        /crowdsec-verify http://127.0.0.1:8125/
+ProxyPassReverse /crowdsec-verify http://127.0.0.1:8125/
+RequestHeader    set X-CrowdSec-Real-IP "expr=%{REMOTE_ADDR}"
+```
+
+Add the allowlist guard (`RewriteCond ${local_allow:%{REMOTE_ADDR}|0} !=1`) to the
+block *and* challenge rules if you use the local lists — the same rule as
+everywhere else here: every rule that stops a request needs the guard.
+
+These directives are subject to the same per-vhost inheritance as the rest, so they
+need `RewriteEngine On` + `RewriteOptions InheritBefore` in each vhost. `mod_proxy`
+and `mod_headers` must be loaded.
 
 ## Verify / operate
 
