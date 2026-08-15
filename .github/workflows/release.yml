@@ -24,9 +24,13 @@ jobs:
         with:
           go-version: "1.26"
 
-      # Gate the release on a green test run - never ship a broken binary.
+      # Gate the release on a green test run - never ship a broken binary. Same
+      # -race as ci.yml: ci only runs on pull_request, so without it here the check
+      # deciding whether a TAGGED binary ships would be weaker than the one deciding
+      # whether a PR can merge, and anything landing without a PR run would reach a
+      # release unchallenged.
       - name: Test
-        run: go test -count=1 ./...
+        run: go test -race -count=1 ./...
 
       # `value` versions the packages - fpm needs a number even on a manual run,
       # hence 0.0.0. `stamp` is what gets linked into the binary, and is
