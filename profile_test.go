@@ -32,7 +32,7 @@ func benchBouncer(b *testing.B) *bouncer {
 		outputFile:           filepath.Join(b.TempDir(), "blocklist.txt"),
 		updateFrequency:      30 * time.Second,
 		expandMaxHosts:       65536,
-		onlyBan:              true,
+		remediations:         []string{"ban"},
 		requestTimeout:       2 * time.Second,
 		streamRequestTimeout: 5 * time.Second,
 		mapType:              "txt",
@@ -185,7 +185,7 @@ func BenchmarkWriteTxt(b *testing.B) {
 			bo.applyFull(ipDecisions(n, 0))
 			b.ReportAllocs()
 			for b.Loop() {
-				if err := bo.writeTxt(); err != nil {
+				if err := bo.writeTxt(banSet(bo)); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -212,7 +212,7 @@ func BenchmarkPollCycle(b *testing.B) {
 			added, removed = bo.applyDelta(nil, churned)
 		}
 		if added > 0 || removed > 0 {
-			if err := bo.writeTxt(); err != nil {
+			if err := bo.writeTxt(banSet(bo)); err != nil {
 				b.Fatal(err)
 			}
 		}

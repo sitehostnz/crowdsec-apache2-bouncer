@@ -23,9 +23,10 @@ type streamResponse struct {
 }
 
 // included reports whether a decision should be enforced: it must be IP- or
-// range-scoped, and (unless ONLY_BAN is disabled) of type=ban.
+// range-scoped, and of a remediation type this bouncer renders a map for (see
+// REMEDIATIONS).
 func (b *bouncer) included(d decision) bool {
-	if b.cfg.onlyBan && !strings.EqualFold(d.Type, "ban") {
+	if b.setFor(d.Type) == nil {
 		return false
 	}
 	scope := strings.ToLower(d.Scope)
