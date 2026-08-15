@@ -23,6 +23,14 @@ RestartSec=5
 # -dir to change); /var stays writable under ProtectSystem=full, and the daemon
 # creates the directory itself. The ReadWritePaths entry ("-" = skip if missing)
 # only matters if you tighten to ProtectSystem=strict or move the dir under /etc.
+# /run/crowdsec-apache2-bouncer holds the challenge readiness file Apache tests
+# before redirecting anyone to the challenge. systemd creates it on start and
+# REMOVES IT WHEN THE UNIT STOPS - including on a crash or a hard kill, where the
+# daemon's own cleanup never runs. That is what makes "the challenge is down" a
+# state Apache can see, instead of one it discovers by proxying into a 503.
+RuntimeDirectory=crowdsec-apache2-bouncer
+RuntimeDirectoryMode=0755
+
 NoNewPrivileges=yes
 ProtectSystem=full
 ProtectHome=yes
