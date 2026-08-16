@@ -579,6 +579,43 @@ These directives are subject to the same per-vhost inheritance as the rest, so t
 need `RewriteEngine On` + `RewriteOptions InheritBefore` in each vhost. `mod_proxy`
 must be loaded.
 
+### Renaming the challenge path
+
+`/crowdsec-verify` is only a default — rename it per provider if you'd rather not
+name CrowdSec in a URL a visitor sees. It's one setting on the daemon, but the
+Apache rules name the path literally, so **both sides have to agree**, and a
+mismatch fails silently: the daemon and Apache each look fine on their own.
+
+On the daemon, set the one env var (keep the leading `/`; nothing ties the value to
+the `crowdsec` name):
+
+```bash
+CAPTCHA_PATH=/verify
+```
+
+Everything the daemon serves follows it — the form's action and the widget's
+challenge fetch at `<CAPTCHA_PATH>/altcha-challenge`. Then change the **same path**
+in every Apache rule that names it, all in the block above:
+
+- the `ProxyPass` and `ProxyPassReverse` targets
+- the redirect target — `RewriteRule ^ /verify?r=%{REQUEST_URI} …`
+- the `!^/verify` exclusion guard on **all three** rules (block, challenge, refuse)
+
+The exclusion guard must be the same prefix as the `ProxyPass` target — it exists to
+exempt exactly what's proxied and nothing more. Out of step, you get the failures
+this project keeps warning about: a wrong guard loops the redirect, and a wrong
+`ProxyPass` leaves the challenge 404ing with the page hung on "Verifying your
+connection".
+
+Two other spots carry a name, if a *completely* CrowdSec-free surface is the goal:
+
+- **The friendly blocked page** (optional extra above) is `/crowdsec-blocked.html`,
+  which shows in the visitor's address bar. Rename its URL-path in the `Alias`, the
+  `ErrorDocument` and its own `!^…` guard together.
+- The widget fetch `<CAPTCHA_PATH>/altcha-challenge` and the solved-token field
+  (default `altcha`) name the widget, not CrowdSec. The field is `CAPTCHA_TOKEN_FIELD`
+  if you want to change it; the `/altcha-challenge` suffix is fixed.
+
 ## Verify / operate
 
 ```bash
