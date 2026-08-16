@@ -509,13 +509,13 @@ RewriteMap solved   txt:/var/lib/crowdsec-apache2-bouncer/captcha_passed.txt
 
 # A ban outranks a captcha, so the block rule stays FIRST.
 RewriteCond %{ENV:REDIRECT_STATUS} ^$
-RewriteCond %{REQUEST_URI} !^/crowdsec-
+RewriteCond %{REQUEST_URI} !^/crowdsec-verify
 RewriteCond ${crowdsec:%{REMOTE_ADDR}|0} =1
 RewriteRule ^ - [F]
 
 # Challenge HTML navigations, while the daemon is up to answer them.
 RewriteCond %{ENV:REDIRECT_STATUS} ^$
-RewriteCond %{REQUEST_URI} !^/crowdsec-
+RewriteCond %{REQUEST_URI} !^/crowdsec-verify
 RewriteCond ${solved:%{REMOTE_ADDR}|0}  !=1
 RewriteCond ${captcha:%{REMOTE_ADDR}|0}  =1
 RewriteCond %{HTTP_ACCEPT} text/html
@@ -525,7 +525,7 @@ RewriteRule ^ /crowdsec-verify?r=%{REQUEST_URI} [R=302,L]
 # Anything else from a challenged client - and everything, once the daemon is
 # down - is refused rather than redirected.
 RewriteCond %{ENV:REDIRECT_STATUS} ^$
-RewriteCond %{REQUEST_URI} !^/crowdsec-
+RewriteCond %{REQUEST_URI} !^/crowdsec-verify
 RewriteCond ${solved:%{REMOTE_ADDR}|0}  !=1
 RewriteCond ${captcha:%{REMOTE_ADDR}|0}  =1
 RewriteRule ^ - [F]
@@ -566,8 +566,10 @@ than a precaution:
    rules are prepended to the vhost's own, so an `[L]` here would also stop the
    customer's rewrites — breaking WordPress permalinks and the like, for exactly the
    visitors who have just solved a challenge. Each rule that *stops* a request
-   therefore carries its full set of guards, and `!^/crowdsec-` is what keeps the
-   challenge itself from being challenged.
+   therefore carries its full set of guards, and `!^/crowdsec-verify` is what keeps
+   the challenge itself from being challenged. It exempts exactly what `ProxyPass`
+   forwards to the listener and no more — a broader `!^/crowdsec-` would let a
+   banned client reach the vhost on any other `/crowdsec-*` path.
 
 Add the allowlist guard (`RewriteCond ${local_allow:%{REMOTE_ADDR}|0} !=1`) to the
 block *and* challenge rules if you use the local lists — the same rule as

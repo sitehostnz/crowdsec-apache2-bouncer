@@ -130,6 +130,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The Apache challenge rules exempt only the proxied `/crowdsec-verify` path from
+  enforcement, not the whole `/crowdsec-*` namespace. The broader `!^/crowdsec-`
+  guard let a banned or challenged client reach the vhost by prefixing any path with
+  `/crowdsec-` (e.g. `/crowdsec-x`): it matched none of the block, challenge or
+  refuse rules and was not proxied, so it fell through to the customer application.
+  The guard now matches the `ProxyPass` scope exactly. ([#2])
 - The challenge fails closed everywhere: a token that is missing, malformed, wrong,
   expired or already spent leaves the client challenged, and a pass that cannot be
   written to disk is reported as a failure rather than a redirect. A fault in the
