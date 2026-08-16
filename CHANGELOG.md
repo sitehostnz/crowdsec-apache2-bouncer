@@ -90,6 +90,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The startup line states the resolved policy outright, e.g. `remediation policy:
   bouncing_on=all override="" fallback="ban" -> ban:ban captcha:captcha throttle:ban`.
   ([#2])
+- The challenge listener allocates less and retains less. Outstanding challenges
+  are held raw and re-encoded on fetch, roughly halving the store's worst-case
+  footprint (~37 MiB at its 200k cap, down from ~65 MiB measured); minting under
+  the plain `SHA-256`/`384`/`512` algorithms reuses one digest instead of
+  allocating ~800 KB of garbage per challenge, halving its CPU; and the widget
+  markup is rendered once at startup rather than on every page. Benchmarks for the
+  whole path live in `profile_test.go`, and the README's challenge-listener
+  section carries the numbers. ([#2])
 
 ### Removed
 

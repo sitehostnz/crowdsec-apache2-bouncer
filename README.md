@@ -454,6 +454,30 @@ with `ALTCHA_COMPLEXITY=10000`.
 > can ever arrive — the visitor is challenged forever. There is no fallback provider, so if any vhost is HTTP-only, either serve it over TLS or keep those
 > decisions on `ban` with `FALLBACK_REMEDIATION=ban`.
 
+**What it costs the daemon.** Benchmarked with the challenge-listener suite in
+`profile_test.go` (`go test -run '^$' -bench . -benchmem`), on a Ryzen 5 7535U at
+the shipped defaults — treat the numbers as shape rather than gospel:
+
+| Operation | When it happens | Cost |
+| --- | --- | --- |
+| Mint a challenge (`PBKDF2/SHA-256`, cost 5000) | once per challenged address per 20 min | ~0.7 ms, ~1 KB allocated |
+| Re-issue the outstanding challenge | every re-fetch by the same address | ~1 µs |
+| Render the challenge page | every challenged `GET` | ~7 µs |
+| Verify a solve | per solve `POST` | ~1.4 µs |
+| Record a pass | per successful solve | ~27 µs holding 1 pass, ~250 µs holding 10,000 — the whole map is rewritten |
+| Challenge store at its 200k cap | worst-case flood | ~195 B per challenge, ~37 MiB total |
+
+The shape to remember: **minting is the only expensive step, and deliberately so** —
+it is one pass of the same KDF the visitor's browser must run thousands of times,
+so it *is* the proof-of-work dial rather than overhead. Everything around it costs
+microseconds. Three things keep a flood from weaponising it: a challenged address
+gets the same challenge back until it solves or expires, so reloads never re-mint;
+concurrent mints are capped at half the CPUs, so the poll loop maintaining the ban
+maps always has a core; and the store refuses new challenges at 200k outstanding, so
+the most an address-hopping flood can pin is ~37 MiB — the refusal is logged, and
+`altcha_challenges_minted_total` on `/metrics` is the rate an abuser would be
+driving up.
+
 **What a pass is keyed on.** The solver's address, matching CrowdSec's own nginx
 bouncer, so the Apache side is a plain map lookup identical to the ban list. One
 solver therefore lets through every browser at that address — everyone behind the

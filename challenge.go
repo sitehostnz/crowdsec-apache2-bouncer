@@ -45,6 +45,13 @@ type challengeServer struct {
 	// misroutedOnce keeps the proxy-misconfiguration hint to one line per start.
 	misroutedOnce sync.Once
 	tmpl          *template.Template
+	// widget is the rendered <altcha-widget> element and solveEvent the event that
+	// means "solved". Both depend only on config, so they are built once at
+	// construction - re-rendering the element was a quarter of a page render's
+	// allocations - and injected whole, so an operator template gets the element
+	// right by construction.
+	widget     template.HTML
+	solveEvent string
 }
 
 // maxSolveBody caps the solve POST. Generous next to the ~200 bytes a real one
@@ -275,13 +282,15 @@ func newChallengeServer(cfg *config, passes *passStore, m *metrics) (*challengeS
 			}
 		}
 	}
-	return &challengeServer{
+	srv := &challengeServer{
 		cfg:     cfg,
 		metrics: m,
 		passes:  passes,
 		tmpl:    tmpl,
 		altcha:  newAltchaStore(),
-	}, nil
+	}
+	srv.widget, srv.solveEvent = srv.widgetMarkup()
+	return srv, nil
 }
 
 // startChallenge brings up the challenge listener when one is configured, and
@@ -583,22 +592,13 @@ func (c *challengeServer) render(w http.ResponseWriter, status int, back, errMsg
 	// somebody else, or replayed later, is at best useless.
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	// The widget element is built here and injected whole rather than written into
-	// the page template, so an operator template gets it right by construction.
-	// Rendered through html/template rather than
-	// fmt.Sprintf: %q is GO quoting, not HTML escaping, so a config value holding a
-	// double quote would break out of the attribute and a bare & would stop being
-	// entity-escaped. These values are operator-set rather than attacker-set, which
-	// makes it a latent hazard rather than a live one - the kind worth closing while
-	// it is still cheap.
-	widget, solveEvent := c.widgetMarkup()
 	err := c.tmpl.Execute(w, map[string]any{
 		"Action":     c.cfg.captchaPath,
 		"Return":     back,
 		"WidgetJS":   c.cfg.captchaWidgetJS,
 		"WidgetSRI":  c.cfg.captchaWidgetSRI,
-		"Widget":     widget,
-		"SolveEvent": solveEvent,
+		"Widget":     c.widget,
+		"SolveEvent": c.solveEvent,
 		"Error":      errMsg,
 	})
 	if err != nil {
@@ -680,7 +680,15 @@ func safeReturn(raw string) string {
 var altchaElement = template.Must(template.New("altcha").Parse(
 	`<altcha-widget id="cs-widget" challenge="{{.Challenge}}" name="{{.Name}}"></altcha-widget>`))
 
-// widgetMarkup builds the element and names the event that means "solved".
+// widgetMarkup builds the element and names the event that means "solved". Run
+// once at construction and kept on the server - the inputs are config, which
+// never changes while the process lives.
+//
+// Rendered through html/template rather than fmt.Sprintf: %q is GO quoting, not
+// HTML escaping, so a config value holding a double quote would break out of the
+// attribute and a bare & would stop being entity-escaped. These values are
+// operator-set rather than attacker-set, which makes it a latent hazard rather
+// than a live one - the kind worth closing while it is still cheap.
 func (c *challengeServer) widgetMarkup() (template.HTML, string) {
 	var buf bytes.Buffer
 	_ = altchaElement.Execute(&buf, map[string]string{

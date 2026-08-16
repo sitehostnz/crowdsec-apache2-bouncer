@@ -224,38 +224,77 @@ func altchaDeriveKey(p altchaParameters, counter uint32) ([]byte, error) {
 	// Plain family: hash salt||password once, then re-hash the previous derived key
 	// for each further iteration, truncating each round - matching the widget's
 	// digest(...).slice(0, keyLength).
-	var derived []byte
+	//
+	// One digest and two buffers for the whole loop, not a fresh h := New /
+	// h.Sum(nil) per round: that shape allocated ~800KB across 10k objects for one
+	// cost-5000 mint, all garbage, which under a mint flood was more allocator and
+	// GC work than hashing. Two buffers rather than one, so Sum never appends over
+	// the bytes the digest was just fed.
+	h := alg.newHash()
+	cur := make([]byte, 0, h.Size())
+	next := make([]byte, 0, h.Size())
 	for i := 0; i < iterations; i++ {
-		data := derived
+		h.Reset()
 		if i == 0 {
-			data = make([]byte, 0, len(salt)+len(password))
-			data = append(data, salt...)
-			data = append(data, password...)
+			h.Write(salt)
+			h.Write(password)
+		} else {
+			h.Write(cur)
 		}
-		h := alg.newHash()
-		h.Write(data)
-		sum := h.Sum(nil)
-		if keyLength < len(sum) {
-			sum = sum[:keyLength]
+		next = h.Sum(next[:0])
+		if keyLength < len(next) {
+			next = next[:keyLength]
 		}
-		derived = sum
+		cur, next = next, cur
 	}
-	return derived, nil
+	return cur, nil
 }
 
-// altchaEntry is one outstanding challenge and the answer it expects.
+// altchaEntry is one outstanding challenge and the answer it expects, held raw.
+// Hex strings and the published JSON are rebuilt by publish on each fetch rather
+// than stored: entries exist to survive a flood - one per address whoever is
+// attacking cares to name - so the resident shape is the one worth shrinking.
+// Raw, an entry retains about half of what the string form did (measured by
+// BenchmarkAltchaHeapAtCap), and the per-fetch encoding it buys back is noise
+// beside the JSON marshalling that follows it.
 type altchaEntry struct {
-	challenge altchaChallenge
-	key       string // the whole derived key, hex; only half of it was published
+	algorithm string // one of altchaAlgorithms' keys; shares the config's string
+	cost      int
+	key       [altchaKeyLength]byte // the whole derived key; only half is ever published
+	salt      [16]byte
+	nonce     [16]byte
 	created   time.Time
 	expires   time.Time
 }
 
+// publish renders the JSON body the widget fetches. Only the key's first half
+// goes out; the rest cannot be known without running the KDF at the right
+// counter, which is the work being asked for.
+//
+// ExpiresAt is read from the entry's own expiry every time, so however often the
+// challenge is re-issued or extended, the published copy cannot fall out of step
+// with the one enforced. That is load-bearing: the widget arms a timer from
+// parameters.expiresAt and calls onExpired() immediately when it is already
+// past, so a published value staler than the entry's hands the visitor a
+// challenge their browser expires on arrival - no verified event, no submit,
+// nothing logged.
+func (e altchaEntry) publish() altchaChallenge {
+	return altchaChallenge{Parameters: altchaParameters{
+		Algorithm: e.algorithm,
+		Cost:      e.cost,
+		ExpiresAt: e.expires.Unix(),
+		KeyLength: altchaKeyLength,
+		KeyPrefix: hex.EncodeToString(e.key[:altchaKeyPrefixLen]),
+		Nonce:     hex.EncodeToString(e.nonce[:]),
+		Salt:      hex.EncodeToString(e.salt[:]),
+	}}
+}
+
 // altchaMaxLive caps the challenges held at once. One entry per challenged address
-// at a few hundred bytes, and the addresses are chosen by whoever is attacking:
-// a single IPv6 /64 offers 2^64 of them, each a fresh key. Unbounded, that is
-// hundreds of MB and eventually an OOM kill - which takes ban enforcement down with
-// it, not just the captcha. 200k entries is roughly 60MB and far above any real
+// at ~195 bytes (BenchmarkAltchaHeapAtCap), and the addresses are chosen by whoever
+// is attacking: a single IPv6 /64 offers 2^64 of them, each a fresh key. Unbounded,
+// that is hundreds of MB and eventually an OOM kill - which takes ban enforcement
+// down with it, not just the captcha. 200k entries is ~37MiB and far above any real
 // number of simultaneously challenged clients.
 const altchaMaxLive = 200_000
 
@@ -308,17 +347,13 @@ func (s *altchaStore) challengeFor(ip, algorithm string, cost int, maxCounter in
 					ext = limit
 				}
 				e.expires = ext
-				// The PUBLISHED expiry has to move with it. The widget arms a timer
-				// from parameters.expiresAt and calls onExpired() immediately when it
-				// is already past, so extending only the server-side copy meant that
-				// from 20 minutes after the mint every re-fetch handed the visitor a
-				// challenge the browser expired on arrival - no verified event, no
-				// submit, nothing logged. A lockout lasting the rest of the window.
-				e.challenge.Parameters.ExpiresAt = ext.Unix()
 				s.live[ip] = e
 			}
+			// publish derives the widget-visible expiry from e.expires, so the
+			// extension above reaches the browser's timer as well as our own.
+			ch := e.publish()
 			s.mu.Unlock()
-			return e.challenge, nil
+			return ch, nil
 		}
 		if inflight, busy := s.minting[ip]; busy {
 			// Someone is already deriving for this address. Wait for their result
@@ -367,15 +402,15 @@ func (s *altchaStore) challengeFor(ip, algorithm string, cost int, maxCounter in
 	// redeem, prune and held() behind ~730us of work, so a /metrics scrape was the
 	// first thing to stall under exactly the flood an operator was trying to see.
 	s.minted() // a derivation, counted whether or not it ends up being stored
-	ch, key, err := newAltchaChallenge(algorithm, cost, maxCounter, now)
+	e, err := newAltchaChallenge(algorithm, cost, maxCounter, now)
 	if err != nil {
 		return altchaChallenge{}, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.live[ip] = altchaEntry{challenge: ch, key: key, created: now, expires: now.Add(altchaChallengeTTL)}
-	return ch, nil
+	s.live[ip] = e
+	return e.publish(), nil
 }
 
 // redeem checks a submitted key against the challenge issued to ip, consuming the
@@ -408,7 +443,12 @@ func (s *altchaStore) redeem(ip, derivedKey string, now time.Time) (altchaEntry,
 	if now.After(e.expires) {
 		return altchaEntry{}, errors.New("challenge expired")
 	}
-	if subtle.ConstantTimeCompare([]byte(strings.ToLower(derivedKey)), []byte(e.key)) != 1 {
+	// hex.DecodeString reads either case, which is the case-insensitivity the
+	// strings.ToLower this replaces provided; anything that is not hex at all
+	// fails the decode and is rejected the same as a wrong answer.
+	submitted, err := hex.DecodeString(derivedKey)
+	if err != nil || len(submitted) != len(e.key) ||
+		subtle.ConstantTimeCompare(submitted, e.key[:]) != 1 {
 		return altchaEntry{}, errors.New("solution does not match the challenge")
 	}
 	// Right answer: spend it. Deleting under the lock, and only if the entry is
@@ -474,13 +514,12 @@ func (s *altchaStore) held() int {
 }
 
 // newAltchaChallenge picks a secret counter below maxCounter and derives the key
-// from it, publishing only the first half. maxCounter is the work dial: the client
-// scans upward from zero, so it expects to try half of them.
-//
-// Returns the challenge to publish and the whole derived key to remember.
-func newAltchaChallenge(algorithm string, cost int, maxCounter int64, now time.Time) (altchaChallenge, string, error) {
+// from it, returning the entry to remember; publish is what exposes the key's
+// first half. maxCounter is the work dial: the client scans upward from zero, so
+// it expects to try half of them.
+func newAltchaChallenge(algorithm string, cost int, maxCounter int64, now time.Time) (altchaEntry, error) {
 	if _, ok := altchaAlgorithms[algorithm]; !ok {
-		return altchaChallenge{}, "", fmt.Errorf("unsupported algorithm %q", algorithm)
+		return altchaEntry{}, fmt.Errorf("unsupported algorithm %q", algorithm)
 	}
 	if maxCounter < 2 {
 		// Refuse rather than clamp, and refuse 1 as well as 0: rand.Int over [0,1)
@@ -488,7 +527,7 @@ func newAltchaChallenge(algorithm string, cost int, maxCounter int64, now time.T
 		// so the "proof" is a fixed value anyone can compute - a captcha that looks
 		// like it is working and asks for nothing. The config floor keeps this out of
 		// reach in production; a caller that gets here has a bug worth hearing about.
-		return altchaChallenge{}, "", fmt.Errorf("counter range %d is too small to ask any work of the client", maxCounter)
+		return altchaEntry{}, fmt.Errorf("counter range %d is too small to ask any work of the client", maxCounter)
 	}
 	if maxCounter > math.MaxUint32 {
 		// The counter is carried in four bytes, so anything past this is unreachable
@@ -498,43 +537,52 @@ func newAltchaChallenge(algorithm string, cost int, maxCounter int64, now time.T
 	// 16 bytes, not 12: FIPS 140-only mode refuses a PBKDF2 salt under 128 bits,
 	// and with the default algorithm that turns every mint into a 500 - no visitor
 	// on a FIPS-hardened host could obtain a challenge at all.
-	saltRaw := make([]byte, 16)
-	if _, err := rand.Read(saltRaw); err != nil {
-		return altchaChallenge{}, "", err
+	var saltRaw, nonceRaw [16]byte
+	if _, err := rand.Read(saltRaw[:]); err != nil {
+		return altchaEntry{}, err
 	}
-	nonceRaw := make([]byte, 16)
-	if _, err := rand.Read(nonceRaw); err != nil {
-		return altchaChallenge{}, "", err
+	if _, err := rand.Read(nonceRaw[:]); err != nil {
+		return altchaEntry{}, err
 	}
 	n, err := rand.Int(rand.Reader, big.NewInt(maxCounter))
 	if err != nil {
-		return altchaChallenge{}, "", err
+		return altchaEntry{}, err
 	}
 
+	// The transient hex form, because the derivation is shared byte-for-byte with
+	// the widget's - altchaDeriveKey reads the published wire format, and minting
+	// through the same code path is what keeps the two provably in agreement.
 	params := altchaParameters{
 		Algorithm: algorithm,
 		Cost:      max(1, cost),
-		ExpiresAt: now.Add(altchaChallengeTTL).Unix(),
 		KeyLength: altchaKeyLength,
-		Nonce:     hex.EncodeToString(nonceRaw),
-		Salt:      hex.EncodeToString(saltRaw),
+		Nonce:     hex.EncodeToString(nonceRaw[:]),
+		Salt:      hex.EncodeToString(saltRaw[:]),
 	}
 	counter := n.Int64()
 	if counter < 0 || counter > math.MaxUint32 {
 		// Unreachable: maxCounter is clamped to MaxUint32 above. Explicit so the
 		// conversion below is provably in range rather than merely known to be.
-		return altchaChallenge{}, "", fmt.Errorf("counter %d out of range", counter)
+		return altchaEntry{}, fmt.Errorf("counter %d out of range", counter)
 	}
 	derived, err := altchaDeriveKey(params, uint32(counter))
 	if err != nil {
-		return altchaChallenge{}, "", err
+		return altchaEntry{}, err
 	}
-	keyHex := hex.EncodeToString(derived)
-	// Only the first half is published; the rest cannot be known without running the
-	// KDF at the right counter, which is the work being asked for.
-	params.KeyPrefix = keyHex[:altchaKeyPrefixLen*2]
-
-	return altchaChallenge{Parameters: params}, keyHex, nil
+	if len(derived) != altchaKeyLength {
+		// Unreachable with the params above; explicit so the array conversion below
+		// cannot panic on a future caller that gets this wrong.
+		return altchaEntry{}, fmt.Errorf("derived key is %d bytes, want %d", len(derived), altchaKeyLength)
+	}
+	return altchaEntry{
+		algorithm: algorithm,
+		cost:      params.Cost,
+		key:       [altchaKeyLength]byte(derived),
+		salt:      saltRaw,
+		nonce:     nonceRaw,
+		created:   now,
+		expires:   now.Add(altchaChallengeTTL),
+	}, nil
 }
 
 // parseAltchaPayload pulls the derived key out of what the widget submitted.

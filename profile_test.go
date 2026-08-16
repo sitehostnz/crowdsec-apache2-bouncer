@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -238,6 +242,191 @@ func BenchmarkDecodeStream(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// ---- challenge listener: per-request costs -------------------------------------
+
+// The poll-path benchmarks above are paced by UPDATE_FREQUENCY; these are paced by
+// whoever Apache sends over, which is why they exist. A challenged client - or a
+// flood pretending to be many of them - drives each of these directly.
+
+// benchChallenge builds a challenge server at the shipped ALTCHA defaults, so the
+// numbers describe the configuration people actually run.
+func benchChallenge(b *testing.B) *challengeServer {
+	b.Helper()
+	cfg := &config{
+		captchaListen:     "127.0.0.1:0",
+		captchaPath:       "/crowdsec-verify",
+		captchaWidgetJS:   altchaDefaultWidgetJS,
+		captchaWidgetSRI:  altchaDefaultWidgetSRI,
+		captchaTokenField: "altcha",
+		captchaPassFile:   filepath.Join(b.TempDir(), "captcha_passed.txt"),
+		captchaPassTTL:    time.Hour,
+		altchaAlgorithm:   altchaDefaultAlgorithm,
+		altchaCost:        altchaDefaultCost,
+		altchaComplexity:  altchaDefaultComplexity,
+	}
+	srv, err := newChallengeServer(cfg, newPassStore(cfg.captchaPassFile, cfg.captchaPassTTL), newMetrics())
+	if err != nil {
+		b.Fatal(err)
+	}
+	return srv
+}
+
+// discardResponseWriter swallows the response, so the handler benchmarks measure
+// the daemon's work rather than httptest's response recording.
+type discardResponseWriter struct{ h http.Header }
+
+func (d *discardResponseWriter) Header() http.Header {
+	if d.h == nil {
+		d.h = http.Header{}
+	}
+	return d.h
+}
+func (d *discardResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (d *discardResponseWriter) WriteHeader(int)             {}
+
+// BenchmarkAltchaMint is the KDF pass behind issuing one challenge - the work an
+// unauthenticated GET can demand of the daemon, and the reason issuance is cached
+// per address and bounded by mintTokens. One sub-benchmark per algorithm family:
+// the two spend their cost completely differently (see altchaAlgorithms).
+func BenchmarkAltchaMint(b *testing.B) {
+	now := time.Now()
+	for _, alg := range []string{"PBKDF2/SHA-256", "SHA-256"} {
+		b.Run(strings.ReplaceAll(alg, "/", "_"), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := newAltchaChallenge(alg, altchaDefaultCost, altchaDefaultComplexity, now); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkChallengeFetch is GET /altcha-challenge through the real handler.
+// cold_per_ip is a flood's shape - every request a fresh address, every response a
+// mint; warm_reissue is a reload - the same address asks again and gets the
+// challenge it already holds.
+func BenchmarkChallengeFetch(b *testing.B) {
+	newReq := func(ip string) *http.Request {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, altchaChallengePath, nil)
+		req.Header.Set("X-Forwarded-For", ip)
+		return req
+	}
+	b.Run("cold_per_ip", func(b *testing.B) {
+		srv := benchChallenge(b)
+		w := &discardResponseWriter{}
+		b.ReportAllocs()
+		i := 0
+		for b.Loop() {
+			srv.altchaChallenge(w, newReq(ipAt(i)))
+			i++
+		}
+	})
+	b.Run("warm_reissue", func(b *testing.B) {
+		srv := benchChallenge(b)
+		w := &discardResponseWriter{}
+		req := newReq("203.0.113.9")
+		srv.altchaChallenge(w, req) // mint once; every iteration below re-issues it
+		b.ReportAllocs()
+		for b.Loop() {
+			srv.altchaChallenge(w, req)
+		}
+	})
+}
+
+// BenchmarkChallengePage renders the challenge page - the response every
+// challenged GET gets until its owner solves, and what a failed solve re-renders
+// with an error.
+func BenchmarkChallengePage(b *testing.B) {
+	srv := benchChallenge(b)
+	w := &discardResponseWriter{}
+	b.ReportAllocs()
+	for b.Loop() {
+		srv.render(w, http.StatusOK, "/checkout", "")
+	}
+}
+
+// BenchmarkSolveVerify is the verification half of a solve: decode the submitted
+// payload and check it against the outstanding challenge. The pass-map write that
+// follows a success is measured separately in BenchmarkPassPublish. Cost 1,
+// because verification is a comparison - its cost does not depend on the work
+// dial, and grinding a cost-5000 solve here would benchmark the test suite.
+func BenchmarkSolveVerify(b *testing.B) {
+	srv := benchChallenge(b)
+	now := time.Now()
+	const ip = "203.0.113.9"
+	ch, err := srv.altcha.challengeFor(ip, altchaDefaultAlgorithm, 1, 2000, now)
+	if err != nil {
+		b.Fatal(err)
+	}
+	key, ok := solveAltcha(ch, 2000)
+	if !ok {
+		b.Fatal("could not solve the benchmark's own challenge")
+	}
+	payload := encodeAltchaPayload(key)
+	b.ReportAllocs()
+	for b.Loop() {
+		got, err := parseAltchaPayload(payload)
+		if err != nil {
+			b.Fatal(err)
+		}
+		e, err := srv.altcha.redeem(ip, got, now)
+		if err != nil {
+			b.Fatal(err)
+		}
+		srv.altcha.restore(ip, e, now) // put it back so the next iteration can spend it again
+	}
+}
+
+// BenchmarkPassPublish is what recording one verified solve costs: the whole pass
+// map is rendered and atomically replaced, so the cost scales with the passes
+// currently held, not with the one being added.
+func BenchmarkPassPublish(b *testing.B) {
+	for _, held := range []int{1, 1_000, 10_000} {
+		b.Run(strconv.Itoa(held)+"_held", func(b *testing.B) {
+			p := newPassStore(filepath.Join(b.TempDir(), "captcha_passed.txt"), time.Hour)
+			now := time.Now()
+			for i := 0; i < held; i++ {
+				p.passes[ipAt(i)] = now.Add(time.Hour) // prefill without a write per entry
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := p.add("203.0.113.9", now); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// altchaSink keeps the filled store reachable, for the same reason sink does.
+var altchaSink *altchaStore
+
+// BenchmarkAltchaHeapAtCap fills the challenge store to altchaMaxLive - the flood
+// ceiling - and reports the live heap that pins: the worst case a challenge flood
+// adds on top of the list itself, and the number altchaMaxLive's own comment
+// promises. Cost 1 - entry size does not depend on the work dial.
+func BenchmarkAltchaHeapAtCap(b *testing.B) {
+	now := time.Now()
+	for b.Loop() {
+		altchaSink = nil
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		s := newAltchaStore()
+		for i := 0; i < altchaMaxLive; i++ {
+			if _, err := s.challengeFor(ipAt(i), altchaDefaultAlgorithm, 1, 2000, now); err != nil {
+				b.Fatal(err)
+			}
+		}
+		altchaSink = s
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		b.ReportMetric(float64(after.HeapAlloc-before.HeapAlloc)/float64(altchaMaxLive), "B/challenge")
+		b.ReportMetric(float64(after.HeapAlloc-before.HeapAlloc)/(1<<20), "MiB_at_cap")
 	}
 }
 
