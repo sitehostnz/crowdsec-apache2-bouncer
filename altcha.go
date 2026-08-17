@@ -147,9 +147,10 @@ const (
 	altchaDefaultCost       = 5000
 	altchaDefaultComplexity = 5000
 	// 20 minutes: ALTCHA's guidance asks for 20 minutes to an hour, and the low end
-	// is right for us. The widget waits to be clicked now, so the gap between
-	// issuing and redeeming is however long a person takes to notice the checkbox -
-	// and a backgrounded tab has its workers throttled.
+	// is right for us. The widget solves on page load now, so the usual gap between
+	// issuing and redeeming is just the solve itself - but a tab opened in the
+	// background has its workers throttled until it is foregrounded, and that wait
+	// is the gap the TTL has to survive.
 	altchaChallengeTTL = 20 * time.Minute
 	// However often a challenge is re-fetched, it stops being extended this long
 	// after it was minted. Extension is what keeps a slow visitor's answer valid

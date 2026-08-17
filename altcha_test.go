@@ -333,16 +333,14 @@ func TestAltchaPageUsesTheAltchaWidget(t *testing.T) {
 		"<altcha-widget",
 		`challenge="/crowdsec-verify/altcha-challenge"`,
 		`name="altcha"`,
+		// Asserted exactly: the widget ignores an attribute it does not recognise,
+		// so a misspelling here would silently fall back to waiting for a click.
+		`auto="onload"`,
 		`"verified"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("challenge page missing %s", want)
 		}
-	}
-	// No auto= attribute: the widget must wait to be clicked rather than start on
-	// load, so merely rendering the page mints nothing.
-	if strings.Contains(body, "auto=") {
-		t.Error("widget carries an auto= attribute - the page would solve unprompted")
 	}
 }
 

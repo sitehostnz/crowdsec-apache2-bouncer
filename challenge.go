@@ -671,14 +671,17 @@ func safeReturn(raw string) string {
 // altchaElement renders the widget with contextual escaping.
 //
 // Attribute names verified against the published widget (v3) - "challenge"
-// carries the endpoint URL ("challengeurl" was v1 and is not read at all) and
-// "name" is the hidden field the payload arrives in. There is deliberately no
-// "auto", so the widget draws a checkbox and waits to be clicked: it gives the
-// visitor something that visibly responds. An automatic solve that fails looks
+// carries the endpoint URL ("challengeurl" was v1 and is not read at all),
+// "name" is the hidden field the payload arrives in, and auto="onload" makes
+// the widget solve as soon as it upgrades instead of waiting for a click.
+// That trades away the earlier caution (an automatic solve that fails looks
 // identical to a hung page, which is exactly how the MIME fault read from the
-// outside.
+// outside) for a check nobody has to notice a checkbox to pass. Server cost
+// is unchanged: the mint a click used to trigger happens at first render
+// instead, and it is the same single mint - challenges are per-address, and a
+// re-fetch inside the TTL returns the one already outstanding.
 var altchaElement = template.Must(template.New("altcha").Parse(
-	`<altcha-widget id="cs-widget" challenge="{{.Challenge}}" name="{{.Name}}"></altcha-widget>`))
+	`<altcha-widget id="cs-widget" challenge="{{.Challenge}}" name="{{.Name}}" auto="onload"></altcha-widget>`))
 
 // widgetMarkup builds the element and names the event that means "solved". Run
 // once at construction and kept on the server - the inputs are config, which
