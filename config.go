@@ -183,11 +183,10 @@ func (c *config) loadCaptcha(dir string) error {
 				"and every challenge WE mint pays ALTCHA_COST of them too, on an endpoint that cannot be authenticated",
 				c.altchaCost, c.altchaComplexity, iter, altchaMaxIterations)
 		}
-		// The pass map must not be the ban list: startChallenge resets it at boot, so
-		// pointing it at blocklist.txt would truncate the ban list and unban everyone.
-		if c.captchaPassFile == c.outputFile {
-			return fmt.Errorf("CAPTCHA_PASS_FILE and OUTPUT_FILE are both %q; a pass map that overwrites the ban list would unban everyone", c.outputFile)
-		}
+		// The pass-file collision check lives in loadConfig rather than here: it has
+		// to compare against every map the daemon renders, and which maps those are
+		// is not known until mapsNeeded runs - which needs the captcha settings this
+		// function is still reading.
 		// A malformed digest is worse than none at all: the browser refuses the
 		// script, the element never upgrades, and the page sits on "Verifying your
 		// connection" with nothing wrong in the markup and nothing logged here. Same
@@ -552,6 +551,34 @@ func loadConfig() (*config, error) {
 	if cfg.captchaUsable() && !slices.Contains(cfg.remediations, remediationCaptcha) {
 		return nil, fmt.Errorf("CAPTCHA_LISTEN is set but nothing can reach the captcha map: "+
 			"BOUNCING_ON_TYPE=%s, OVERRIDE_REMEDIATION=%q", cfg.bouncingOnType, cfg.overrideRemediation)
+	}
+	// The pass map must not share a path with anything else this daemon writes:
+	// startChallenge resets it at boot, so a collision truncates whatever file it
+	// lands on. Checked against every rendered map, not just the ban list, and
+	// only after mapsNeeded so the rendered set is the real one. Paths are
+	// Clean()ed so a spelling like dir//file still matches; a symlink does not,
+	// but this guards a config slip, not an adversary.
+	passFile := filepath.Clean(cfg.captchaPassFile)
+	for _, name := range cfg.remediations {
+		txt, dbm := cfg.mapPaths(name)
+		for _, rendered := range []string{txt, dbm} {
+			if passFile != filepath.Clean(rendered) {
+				continue
+			}
+			if name == remediationBan {
+				return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the ban map are both %q; a pass map that overwrites the ban list would unban everyone", rendered)
+			}
+			return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the %s map are both %q; resetting the pass map would empty it until the next poll rebuilds it", name, rendered)
+		}
+	}
+	// Custom lists are worse off than the maps: they are operator-maintained, so
+	// nothing would ever rebuild one the reset has truncated.
+	for _, list := range newCustomLists(cfg.customListDir) {
+		for _, kept := range []string{list.txt, list.dbm} {
+			if passFile == filepath.Clean(kept) {
+				return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the custom %s are both %q; the pass map is reset at boot, and nothing rebuilds a truncated custom list", list.name, kept)
+			}
+		}
 	}
 	// REQUEST_TIMEOUT is a per-phase bound nested inside the overall
 	// STREAM_REQUEST_TIMEOUT deadline, so a larger value would be masked by the

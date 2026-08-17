@@ -30,7 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no shared secret and nothing on the wire — and records the client in a pass map
   Apache checks ahead of the captcha map. The pass map is a `txt:` map so a solve
   goes live on the client's next request rather than waiting for a DBM rebuild.
-  ([#2])
+  Its path (`CAPTCHA_PASS_FILE`) is refused at startup when it collides with any
+  file the daemon writes — a rendered map, its DBM, or a custom list — because the
+  pass map is reset at boot and would truncate whatever it landed on. The widget
+  starts solving as soon as the page loads, so a visitor passes without having to
+  interact. ([#2])
 
   The proof of work is [ALTCHA](https://altcha.org)'s: the daemon publishes half of
   a derived key and keeps the other half, and the browser searches counters until

@@ -615,3 +615,75 @@ func TestLoopbackListen(t *testing.T) {
 		}
 	}
 }
+
+// The pass map is reset (truncated) whenever the challenge listener starts, so a
+// path collision with any file the daemon renders - or with an operator's custom
+// list, which nothing would rebuild - has to be refused at load time, not
+// discovered as an empty ban list after the next boot.
+func TestPassFileCollisionGuard(t *testing.T) {
+	load := func(t *testing.T, env map[string]string) error {
+		t.Helper()
+		clearEnv(t)
+		t.Setenv("CROWDSEC_API_KEY", "k")
+		for k, v := range env {
+			t.Setenv(k, v)
+		}
+		_, err := loadConfig()
+		return err
+	}
+
+	refused := map[string]map[string]string{
+		"the ban txt map": {
+			"CAPTCHA_PASS_FILE": "/var/lib/crowdsec-apache2-bouncer/blocklist.txt",
+		},
+		// filepath.Clean has to see through a doubled separator, or the guard is
+		// defeated by a spelling rather than a different path.
+		"the ban txt map, unclean spelling": {
+			"CAPTCHA_PASS_FILE": "/var/lib/crowdsec-apache2-bouncer//blocklist.txt",
+		},
+		"the ban dbm map": {
+			"CAPTCHA_PASS_FILE": "/var/lib/crowdsec-apache2-bouncer/blocklist.dbm",
+		},
+		"the captcha map, when one is rendered": {
+			"BOUNCING_ON_TYPE":  "all",
+			"CAPTCHA_LISTEN":    "127.0.0.1:0",
+			"CAPTCHA_PASS_FILE": "/var/lib/crowdsec-apache2-bouncer/captcha.txt",
+		},
+		"a custom allowlist": {
+			"CUSTOM_LIST_DIR":   "/etc/apache2/crowdsec",
+			"CAPTCHA_PASS_FILE": "/etc/apache2/crowdsec/allowlist.txt",
+		},
+		"a custom denylist dbm": {
+			"CUSTOM_LIST_DIR":   "/etc/apache2/crowdsec",
+			"CAPTCHA_PASS_FILE": "/etc/apache2/crowdsec/denylist.dbm",
+		},
+	}
+	for name, env := range refused {
+		t.Run("refuses "+name, func(t *testing.T) {
+			if err := load(t, env); err == nil {
+				t.Fatal("a pass file colliding with a file the daemon writes must be refused")
+			}
+		})
+	}
+
+	// And no overreach: the default pass file loads, captcha.txt is fine while no
+	// captcha map is rendered (the daemon never writes it then), and a custom-list
+	// path is fine with the lists switched off.
+	allowed := map[string]map[string]string{
+		"the default pass file": {},
+		"captcha.txt while no captcha map is rendered": {
+			"CAPTCHA_PASS_FILE": "/var/lib/crowdsec-apache2-bouncer/captcha.txt",
+		},
+		"a custom-list path with custom lists off": {
+			"CUSTOM_LIST_DIR":   "",
+			"CAPTCHA_PASS_FILE": "/etc/apache2/crowdsec/allowlist.txt",
+		},
+	}
+	for name, env := range allowed {
+		t.Run("allows "+name, func(t *testing.T) {
+			if err := load(t, env); err != nil {
+				t.Fatalf("must load: %v", err)
+			}
+		})
+	}
+}
