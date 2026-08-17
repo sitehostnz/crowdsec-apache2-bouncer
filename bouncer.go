@@ -159,7 +159,7 @@ func newBouncer(cfg *config) (*bouncer, error) {
 // bouncer renders no map for it. Matching is case-insensitive: the LAPI's casing
 // is not guaranteed.
 //
-// FORCE_REMEDIATION sends every enforceable decision to one map regardless of its
+// OVERRIDE_REMEDIATION sends every enforceable decision to one map regardless of its
 // own type. It still only redirects types the bouncer would otherwise have
 // enforced - a throttle has no map of its own, and forcing it into one would
 // apply a remediation the hub never asked for.

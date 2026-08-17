@@ -24,7 +24,8 @@ type streamResponse struct {
 
 // included reports whether a decision should be enforced: it must be IP- or
 // range-scoped, and of a remediation type this bouncer renders a map for (see
-// REMEDIATIONS).
+// resolveRemediation for how BOUNCING_ON_TYPE, OVERRIDE_REMEDIATION and
+// FALLBACK_REMEDIATION decide that).
 func (b *bouncer) included(d decision) bool {
 	if b.setFor(d.Type) == nil {
 		return false

@@ -228,7 +228,7 @@ func TestOverrideRemediation(t *testing.T) {
 		})
 		ban, captcha := b.setFor("ban"), b.setFor("captcha")
 		if ban != captcha {
-			t.Fatal("with FORCE_REMEDIATION every type must resolve to the one set")
+			t.Fatal("with OVERRIDE_REMEDIATION every type must resolve to the one set")
 		}
 		if len(captcha.refcount) != 3 {
 			t.Fatalf("captcha map = %v, want every bounced decision", captcha.refcount)
@@ -255,7 +255,7 @@ func TestOverrideRemediation(t *testing.T) {
 		})
 		b.applyFull([]decision{dec("1", "Ip", "198.51.100.4", "captcha")})
 		if _, ok := b.byType["ban"].refcount["198.51.100.4"]; !ok {
-			t.Fatal("FORCE_REMEDIATION=ban must block a captcha decision outright")
+			t.Fatal("OVERRIDE_REMEDIATION=ban must block a captcha decision outright")
 		}
 	})
 
