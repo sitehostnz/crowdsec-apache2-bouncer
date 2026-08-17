@@ -628,6 +628,40 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://<customer-domain>/   # from th
 cscli decisions delete --ip <your-test-ip>
 ```
 
+### Reloading configuration
+
+After editing the env file, apply the runtime knobs without dropping the process:
+
+```bash
+systemctl reload crowdsec-apache2-bouncer
+```
+
+The catch this works around: the env file is the unit's `EnvironmentFile`, and
+systemd reads that **only at start** — `systemctl reload` runs inside the live
+process and does not re-read it. So the daemon re-reads the file itself on `SIGHUP`
+(`ExecReload` sends it; the daemon's `-config` defaults to the same path). The
+values apply on top of the running environment, so **to change a setting, edit its
+line** — deleting a line leaves the start-time value in place until a restart.
+
+**Applied live** — the runtime knobs: `UPDATE_FREQUENCY`, `RESYNC_INTERVAL`,
+`EXPAND_MAX_HOSTS`, `STREAM_REQUEST_TIMEOUT`, the `ALTCHA_*` dials (cost, complexity,
+algorithm) and `CAPTCHA_PASS_TTL`. Each reload logs exactly what it changed.
+
+**Restart required** — everything structural: the listen addresses
+(`CAPTCHA_LISTEN`, `METRICS_LISTEN`), the LAPI settings (`CROWDSEC_LAPI_URL`,
+`CROWDSEC_API_KEY`, `INSECURE`, `CA_BUNDLE`, `REQUEST_TIMEOUT`), the map paths and
+type (`OUTPUT_FILE`, `DBM_FILE`, `MAP_TYPE`, `CUSTOM_LIST_DIR`), the challenge page
+(`CAPTCHA_PATH`, `CAPTCHA_TEMPLATE`, `CAPTCHA_WIDGET_*`, `CAPTCHA_TOKEN_FIELD`) and
+the remediation policy (`BOUNCING_ON_TYPE`, `OVERRIDE_REMEDIATION`,
+`FALLBACK_REMEDIATION`). A reload **detects** a change to any of these and logs it
+by name as needing a restart, rather than half-applying it — so a reload never
+silently does nothing. Run `systemctl restart` to apply them; the daemon rebuilds
+its list from the LAPI on the way back up.
+
+> The remediation policy is deliberately restart-only: changing which decisions
+> become bans vs captchas re-derives the whole map set, which needs a full resync
+> to refill correctly — a restart is the clean way to get there.
+
 ## Security
 
 - API key lives only in the `0600` EnvironmentFile, never in the script.

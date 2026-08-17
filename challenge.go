@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template/parse"
 	"time"
 )
@@ -42,6 +43,11 @@ type challengeServer struct {
 	metrics *metrics
 	passes  *passStore
 	altcha  *altchaStore
+	// dials are the ALTCHA work parameters, held apart from cfg because a reload can
+	// change them while requests are minting challenges. Swapped atomically by the
+	// poll goroutine (see bouncer.reload), read by every request goroutine - which
+	// is why they are not left in cfg, where a plain write would race those reads.
+	dials atomic.Pointer[altchaDials]
 	// misroutedOnce keeps the proxy-misconfiguration hint to one line per start.
 	misroutedOnce sync.Once
 	tmpl          *template.Template
@@ -289,8 +295,18 @@ func newChallengeServer(cfg *config, passes *passStore, m *metrics) (*challengeS
 		tmpl:    tmpl,
 		altcha:  newAltchaStore(),
 	}
+	srv.dials.Store(&altchaDials{algorithm: cfg.altchaAlgorithm, cost: cfg.altchaCost, complexity: cfg.altchaComplexity})
 	srv.widget, srv.solveEvent = srv.widgetMarkup()
 	return srv, nil
+}
+
+// altchaDials are the challenge work parameters a reload may change while the
+// listener is serving. Everything else the listener reads out of cfg is fixed
+// once it is built.
+type altchaDials struct {
+	algorithm  string
+	cost       int
+	complexity int64
 }
 
 // startChallenge brings up the challenge listener when one is configured, and
@@ -316,8 +332,10 @@ func (b *bouncer) startChallenge(ctx context.Context) {
 		b.passes = nil
 		return
 	}
-	// Kept so the poll loop can expire abandoned challenges - see prunePasses.
+	// Kept so the poll loop can expire abandoned challenges (prunePasses) and apply
+	// a reload's ALTCHA dials to it (see bouncer.reload).
 	b.altcha = srv.altcha
+	b.challenge = srv
 	srv.altcha.minted = func() { b.metrics.challengesMinted.Add(1) }
 	go srv.serve(ctx)
 }
@@ -466,7 +484,9 @@ func (c *challengeServer) altchaChallenge(w http.ResponseWriter, r *http.Request
 		return // the client gave up; do not start work for nobody
 	}
 	// Same challenge back until it is solved or expires, so reloads cost nothing.
-	ch, err := c.altcha.challengeFor(ip, c.cfg.altchaAlgorithm, c.cfg.altchaCost, c.cfg.altchaComplexity, time.Now())
+	// Dials read from the atomic snapshot, not cfg: a SIGHUP can swap them mid-serve.
+	d := c.dials.Load()
+	ch, err := c.altcha.challengeFor(ip, d.algorithm, d.cost, d.complexity, time.Now())
 	if err != nil {
 		log.Printf("challenge: issuing an ALTCHA challenge: %v", err)
 		http.Error(w, "cannot issue a challenge", http.StatusInternalServerError)
@@ -566,7 +586,9 @@ func (c *challengeServer) solve(w http.ResponseWriter, r *http.Request, ip strin
 		return
 	}
 	c.metrics.solvesOK.Add(1)
-	log.Printf("challenge: %s solved; pass held for %s (%d total)", ip, c.cfg.captchaPassTTL, c.passes.held()) //nolint:gosec // G706: ip is parsed by clientIP
+	// ttlOf, not cfg: a reload can change the pass lifetime, and this line should
+	// report the one actually granted.
+	log.Printf("challenge: %s solved; pass held for %s (%d total)", ip, c.passes.ttlOf(), c.passes.held()) //nolint:gosec // G706: ip is parsed by clientIP
 	// back has been through safeReturn, which rejects anything that is not a
 	// single-slash-rooted local path - that is the open-redirect guard.
 	http.Redirect(w, r, back, http.StatusFound) //nolint:gosec // G710: safeReturn is the guard

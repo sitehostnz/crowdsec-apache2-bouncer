@@ -19,6 +19,10 @@ import (
 // overflow time.Duration (int64 ns). 10 years is far beyond any real setting.
 const maxDurationSecs = 315360000
 
+// defaultConfigFile is where the packaged unit keeps its EnvironmentFile, and so
+// the file a reload re-reads unless -config or CONFIG_FILE points elsewhere.
+const defaultConfigFile = "/etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf"
+
 // Bounds for RESYNC_INTERVAL. A full snapshot is the expensive LAPI query, and the
 // stream deltas already keep the list current between re-syncs - so hourly is as
 // often as it is worth paying for, and a day is as long as cursor drift should go
@@ -74,6 +78,13 @@ type config struct {
 	// own listener: the challenge one is proxied to the public internet.
 	metricsListen string
 	metricsPath   string
+
+	// configFile is the env file a SIGHUP re-reads. It is the same file systemd
+	// loads as EnvironmentFile - but systemd only reads that at unit start, so the
+	// daemon has to read it itself for `systemctl reload` to pick up an edit. Empty
+	// (no -config, no CONFIG_FILE) leaves reload with nothing to re-read. Not
+	// itself reloadable: a reload never changes where the next reload reads from.
+	configFile string
 }
 
 // loadCaptcha fills in the challenge listener's settings and checks the ones that
@@ -152,7 +163,7 @@ func (c *config) loadCaptcha(dir string) error {
 		// "remove" one - but systemd's EnvironmentFile still sets it. Treating that
 		// as present made `CAPTCHA_SECRET=` a fatal error, and the fatal takes ban
 		// enforcement down with the captcha it was complaining about.
-		if os.Getenv(gone.name) != "" {
+		if v, _ := envLookup(gone.name); v != "" {
 			return fmt.Errorf("%s is no longer used: %s. Remove it from the environment file", gone.name, gone.was)
 		}
 	}
@@ -408,7 +419,7 @@ func optionalRemediation(name, def string) (string, error) {
 // shares no vocabulary with the nginx bouncer an operator is likely running
 // beside this one. BOUNCING_ON_TYPE replaces it exactly.
 func legacyBouncingOnType() string {
-	v, set := os.LookupEnv("ONLY_BAN")
+	v, set := envLookup("ONLY_BAN")
 	if !set || strings.TrimSpace(v) == "" {
 		return remediationBan
 	}
@@ -438,9 +449,15 @@ func (c *config) mapPaths(name string) (txt, dbm string) {
 	return txt, defaultDBMPath(txt)
 }
 
+// envLookup is where config values are read from. It defaults to the process
+// environment; a reload points it at the parsed conf file (falling back to the
+// environment) so `systemctl reload` picks up an edit that systemd's
+// EnvironmentFile would otherwise only apply on a restart. See loadConfigFromFile.
+var envLookup = os.LookupEnv
+
 // envStr returns environment variable name, or def when it is unset or empty.
 func envStr(name, def string) string {
-	if v := os.Getenv(name); v != "" {
+	if v, _ := envLookup(name); v != "" {
 		return v
 	}
 	return def
@@ -449,7 +466,7 @@ func envStr(name, def string) string {
 // envInt returns environment variable name parsed as an int, falling back to def
 // when it is unset, empty or unparseable.
 func envInt(name string, def int) int {
-	v := os.Getenv(name)
+	v, _ := envLookup(name)
 	if v == "" {
 		return def
 	}
@@ -463,7 +480,7 @@ func envInt(name string, def int) int {
 // envBool returns environment variable name as a bool (1/true/yes/on are true;
 // anything else is false), or def when it is unset.
 func envBool(name string, def bool) bool {
-	v := os.Getenv(name)
+	v, _ := envLookup(name)
 	if v == "" {
 		return def
 	}
@@ -479,7 +496,7 @@ func envBool(name string, def bool) bool {
 // Unlike envStr, an explicitly empty value comes back empty rather than falling
 // back to def - which lets an operator write "VAR=" to turn a feature off.
 func envOptional(name, def string) string {
-	if v, ok := os.LookupEnv(name); ok {
+	if v, ok := envLookup(name); ok {
 		return strings.TrimSpace(v)
 	}
 	return def
@@ -545,6 +562,13 @@ func loadConfig() (*config, error) {
 	}
 	cfg.metricsListen = envStr("METRICS_LISTEN", "")
 	cfg.metricsPath = envStr("METRICS_PATH", "/metrics")
+	// The -config flag wins over CONFIG_FILE so a reload's source can be set on the
+	// command line; both default to the path the packaged unit uses as its
+	// EnvironmentFile, so the shipped install reloads with no extra configuration.
+	cfg.configFile = *flagConfig
+	if cfg.configFile == "" {
+		cfg.configFile = envStr("CONFIG_FILE", defaultConfigFile)
+	}
 	// Never empty: BOUNCING_ON_TYPE always names at least one remediation this
 	// bouncer can express, and that one always resolves to itself.
 	cfg.remediations = cfg.mapsNeeded()
@@ -612,4 +636,73 @@ func resyncEvery(secs int) time.Duration {
 // trailing .txt for .dbm.
 func defaultDBMPath(outputFile string) string {
 	return strings.TrimSuffix(outputFile, ".txt") + ".dbm"
+}
+
+// loadConfigFromFile builds a config as if the values in path were the
+// environment, falling back to the real environment for anything the file does
+// not set. It is how a reload sees an edited conf file: systemd loads that same
+// file as EnvironmentFile, but only at unit start, so `systemctl reload` would
+// otherwise re-read the identical startup environment and change nothing.
+//
+// The environment fallback means a key present at start but absent from the file
+// keeps its start-time value rather than snapping back to a default - so to
+// change a setting you edit its line, you do not rely on deleting one. loadConfig
+// runs unchanged on top, so every default, clamp, validation and warning is the
+// same on a reload as on a cold start.
+func loadConfigFromFile(path string) (*config, error) {
+	fileEnv, err := parseEnvFile(path)
+	if err != nil {
+		return nil, err
+	}
+	prev := envLookup
+	// Restored before returning: envLookup is process-global, and nothing else may
+	// be left reading config out of a file. Safe without a lock because loadConfig
+	// only ever runs on the goroutine driving startup or the reload, never both at
+	// once.
+	defer func() { envLookup = prev }()
+	envLookup = func(name string) (string, bool) {
+		if v, ok := fileEnv[name]; ok {
+			return v, true
+		}
+		return prev(name)
+	}
+	return loadConfig()
+}
+
+// parseEnvFile reads a systemd-style EnvironmentFile into a map. It handles the
+// subset the shipped file uses and that an operator is likely to write: KEY=VALUE
+// one per line, blank lines, and whole-line comments starting with '#' or ';'.
+// A value wrapped in matching single or double quotes has them stripped;
+// otherwise surrounding whitespace is trimmed.
+//
+// Deliberately not a full systemd parser: no C-style escapes, no line
+// continuations, no inline comments (systemd does not take those either). A line
+// with no '=' is skipped rather than failing the whole reload, since one stray
+// line should not strand every good setting beside it.
+func parseEnvFile(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path) // #nosec G304 -- operator config path, not request input
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || trimmed[0] == '#' || trimmed[0] == ';' {
+			continue
+		}
+		key, val, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			continue // not KEY=VALUE; skip rather than fail the reload
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		val = strings.TrimSpace(val)
+		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {
+			val = val[1 : len(val)-1] // strip matching surrounding quotes
+		}
+		out[key] = val
+	}
+	return out, nil
 }

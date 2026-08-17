@@ -47,6 +47,10 @@ type bouncer struct {
 	// the ones nobody came back for; nil unless the listener came up
 	altcha *altchaStore
 
+	// challenge is the running listener, kept so a reload can swap its ALTCHA dials;
+	// nil unless the listener came up
+	challenge *challengeServer
+
 	// pendingShrink counts consecutive full snapshots that would have dropped most
 	// of the list; see acceptSnapshot.
 	pendingShrink int

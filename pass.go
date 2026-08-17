@@ -93,6 +93,23 @@ func (p *passStore) held() int {
 	return len(p.passes)
 }
 
+// ttlOf reports the pass lifetime currently in force. Read under the mutex
+// because a reload can change it (setTTL) while the listener records a pass.
+func (p *passStore) ttlOf() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ttl
+}
+
+// setTTL changes the lifetime new passes are granted. Passes already held keep
+// the expiry they were written with; only ones added after this take the new
+// value, which is the same way a restart would behave for anything still on disk.
+func (p *passStore) setTTL(ttl time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ttl = ttl
+}
+
 // writeLocked renders the map atomically. Callers must hold the mutex.
 func (p *passStore) writeLocked() error {
 	dir := filepath.Dir(p.path)

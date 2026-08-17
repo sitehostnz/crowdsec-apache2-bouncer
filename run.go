@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -43,6 +46,15 @@ func describeRemediation(r string) string {
 // UPDATE_FREQUENCY, applying deltas or a periodic full resync until ctx is
 // cancelled. It never wipes the list on an LAPI error.
 func (b *bouncer) run(ctx context.Context) {
+	// Catch SIGHUP before the initial sync, which can retry for a long time when the
+	// LAPI is unreachable: SIGHUP's default disposition is to KILL the process, so
+	// registering it late would turn a reload during an outage into an outage of us
+	// too. It is handled in the ticker loop below; one that arrives earlier waits in
+	// the buffer until then.
+	reloadCh := make(chan os.Signal, 1)
+	signal.Notify(reloadCh, syscall.SIGHUP)
+	defer signal.Stop(reloadCh)
+
 	maps := make([]string, 0, len(b.remediations))
 	for _, r := range b.remediations {
 		out := r.txt
@@ -104,6 +116,14 @@ func (b *bouncer) run(ctx context.Context) {
 		case <-ctx.Done():
 			log.Printf("shutting down")
 			return
+		case <-reloadCh:
+			// A reload is not a poll: apply the config and go back to waiting rather
+			// than falling through into a fetch. Reset the ticker only when the
+			// interval actually changed, so a reload does not shift the poll schedule.
+			if b.reload() {
+				ticker.Reset(b.cfg.updateFrequency)
+			}
+			continue
 		case <-ticker.C:
 		}
 		cycleStart := time.Now()

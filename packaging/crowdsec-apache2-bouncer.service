@@ -16,6 +16,13 @@ StartLimitBurst=5
 Type=simple
 EnvironmentFile=/etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf
 ExecStart=/usr/local/bin/crowdsec-apache2-bouncer
+# `systemctl reload` re-reads the EnvironmentFile above. systemd only loads that
+# file at START, and reload runs inside the live process, so the daemon re-reads
+# the file itself on SIGHUP (its -config defaults to this same path). Only the
+# runtime knobs apply live - poll/resync cadence, expand cap, the ALTCHA dials and
+# the pass TTL; a changed listen address, LAPI setting, map path or remediation
+# policy is logged as needing a restart. `systemctl restart` applies everything.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 

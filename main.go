@@ -40,6 +40,11 @@ var flagDir = flag.String("dir", "", "directory for blocklist.txt/.dbm (default 
 // is exactly when the question comes up.
 var flagVersion = flag.Bool("version", false, "print the version and exit")
 
+// -config names the env file SIGHUP re-reads (see reload). It defaults to the
+// path the packaged unit uses as its EnvironmentFile, so the shipped install
+// reloads with no extra flag; CONFIG_FILE overrides it too, the flag winning.
+var flagConfig = flag.String("config", "", "env file to re-read on SIGHUP (default the packaged unit's EnvironmentFile, or CONFIG_FILE)")
+
 // main loads the config, builds the bouncer, and runs it until SIGINT/SIGTERM.
 func main() {
 	log.SetFlags(log.LstdFlags) // local date+time on each line (journald adds its own too)

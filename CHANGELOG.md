@@ -68,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a refusal at the Apache layer. ([#2])
 - `-version` prints the build and exits, without needing the daemon to start or
   `METRICS_LISTEN` to be set.
+- `systemctl reload` (SIGHUP) re-reads the config file and applies the runtime
+  knobs without dropping the process: `UPDATE_FREQUENCY`, `RESYNC_INTERVAL`,
+  `EXPAND_MAX_HOSTS`, `STREAM_REQUEST_TIMEOUT`, the `ALTCHA_*` dials and
+  `CAPTCHA_PASS_TTL`. The daemon re-reads the file itself because systemd loads the
+  `EnvironmentFile` only at start, so a reload would otherwise re-read the identical
+  startup environment; `-config` (default the packaged unit's `EnvironmentFile`, or
+  `CONFIG_FILE`) names the file. Structural settings — listen addresses, the LAPI
+  client, map paths and type, the challenge page, and the remediation policy — are
+  detected and logged by name as needing a restart rather than half-applied, so a
+  reload never silently does nothing.
 
 ### Changed
 
