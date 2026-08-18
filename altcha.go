@@ -600,8 +600,8 @@ func parseAltchaPayload(encoded string) (string, error) {
 		return "", fmt.Errorf("payload is not the expected JSON: %w", err)
 	}
 	// A solution is always exactly the hex of an altchaKeyLength key. Checking the
-	// length here means an oversized one is rejected before redeem lower-cases and
-	// converts it - three more copies of whatever was sent.
+	// length here means an oversized one is rejected before redeem hex-decodes it,
+	// rather than after allocating a copy of whatever was sent.
 	if got := len(p.Solution.DerivedKey); got != altchaKeyLength*2 {
 		return "", fmt.Errorf("derived key is %d characters, want %d", got, altchaKeyLength*2)
 	}

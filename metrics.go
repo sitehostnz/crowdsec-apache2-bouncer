@@ -179,7 +179,7 @@ func (b *bouncer) renderMetrics() string {
 		)
 	}
 
-	if b.cfg.captchaListen != "" {
+	if b.cfg.captchaUsable() {
 		held := 0
 		if b.passes != nil {
 			held = b.passes.held()

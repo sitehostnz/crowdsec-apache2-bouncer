@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"text/template/parse"
 	"time"
 )
@@ -42,9 +42,16 @@ type challengeServer struct {
 	metrics *metrics
 	passes  *passStore
 	altcha  *altchaStore
-	// misroutedOnce keeps the proxy-misconfiguration hint to one line per start.
-	misroutedOnce sync.Once
-	tmpl          *template.Template
+	// misroutedAt is when the proxy-misconfiguration hint was last logged, as Unix
+	// seconds, throttling it to one line per misroutedEvery.
+	//
+	// Deliberately NOT a sync.Once. The path that triggers this is client-supplied,
+	// so any caller could request one ending in /altcha-challenge and burn a
+	// once-per-process hint on demand - after which a real misconfiguration would
+	// never log the line that explains it, which is the one job it has. A throttle
+	// bounds the log volume without letting anyone silence it permanently.
+	misroutedAt atomic.Int64
+	tmpl        *template.Template
 	// widget is the rendered <altcha-widget> element and solveEvent the event that
 	// means "solved". Both depend only on config, so they are built once at
 	// construction - re-rendering the element was a quarter of a page render's
@@ -71,6 +78,22 @@ func mintConcurrency() int {
 		return n
 	}
 	return 1
+}
+
+// misroutedEvery is how often the proxy-misconfiguration hint may repeat. Long
+// enough that a flood of crafted paths cannot fill the log, short enough that an
+// operator restarting Apache mid-diagnosis still sees it.
+const misroutedEvery = 10 * time.Minute
+
+// shouldLogMisrouted reports whether the hint is due, and claims the slot if so.
+// The compare-and-swap is what makes it one line rather than one per concurrent
+// request: whichever goroutine swaps first logs, the rest see the updated stamp.
+func (c *challengeServer) shouldLogMisrouted(now time.Time) bool {
+	last := c.misroutedAt.Load()
+	if last != 0 && now.Sub(time.Unix(last, 0)) < misroutedEvery {
+		return false
+	}
+	return c.misroutedAt.CompareAndSwap(last, now.Unix())
 }
 
 // challengePage is the default challenge. It is deliberately plain: it has to
@@ -494,14 +517,14 @@ func (c *challengeServer) handle(w http.ResponseWriter, r *http.Request) {
 	// parse a page as JSON, which is a spinner that never resolves and nothing in any
 	// log. Say so instead, once, with the fix in the message.
 	if strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), altchaChallengePath) {
-		c.misroutedOnce.Do(func() {
+		if c.shouldLogMisrouted(time.Now()) {
 			// %q, not %s: the path is attacker-controlled and %0a decodes to a real
 			// newline, which would let a request forge log lines. Go's quoting escapes
 			// it. gosec cannot see that, hence the suppression rather than a change.
 			log.Printf("challenge: %q reached the catch-all handler, so the widget is asking for a path Apache is not mapping here. "+ //nolint:gosec // G706: %q escapes control characters
 				"Check ProxyPass has NO trailing slash on either side: "+
-				"ProxyPass /crowdsec-verify http://%s", r.URL.Path, c.cfg.captchaListen)
-		})
+				"ProxyPass %s http://%s", r.URL.Path, c.cfg.captchaPath, c.cfg.captchaListen)
+		}
 		http.Error(w, "misrouted challenge request", http.StatusNotFound)
 		return
 	}
@@ -521,9 +544,9 @@ func (c *challengeServer) handle(w http.ResponseWriter, r *http.Request) {
 // the pass and sends the client back where they were going.
 func (c *challengeServer) solve(w http.ResponseWriter, r *http.Request, ip string) {
 	// A real solve is a couple of hundred bytes. Without this, ParseForm accepts
-	// net/http's 10MB default and the token is then base64-decoded, unmarshalled,
-	// lower-cased and converted before a length check rejects it - measured at 40MB
-	// of allocation for ONE request, on an endpoint that cannot be authenticated.
+	// net/http's 10MB default and the token is then base64-decoded and unmarshalled
+	// before a length check rejects it - measured at 40MB of allocation for ONE
+	// request, on an endpoint that cannot be authenticated.
 	r.Body = http.MaxBytesReader(w, r.Body, maxSolveBody)
 	if err := r.ParseForm(); err != nil {
 		// Counted, because this is the path an oversized body takes and it was the
@@ -627,10 +650,22 @@ func (c *challengeServer) clientIP(r *http.Request) (string, error) {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		last := strings.TrimSpace(parts[len(parts)-1])
-		if addr, err := netip.ParseAddr(last); err == nil {
-			return addr.Unmap().String(), nil
+		addr, err := netip.ParseAddr(last)
+		if err != nil {
+			// The last entry is the one mod_proxy appended - the peer it actually saw -
+			// and the only trustworthy one. If it will not parse, something upstream is
+			// wrong: ProxyAddHeaders off, X-Forwarded-For stripped, or the listener
+			// reached other than through the proxy. Fail closed rather than fall through
+			// to RemoteAddr, which behind ProxyPass is loopback: that fallback would key
+			// every such client to 127.0.0.1 - one shared identity no %{REMOTE_ADDR}
+			// lookup can match, so the pass never takes and the client loops through the
+			// challenge. %q escapes control bytes so an XFF value cannot forge log lines.
+			return "", fmt.Errorf("no usable client address: X-Forwarded-For %q has an unparseable final entry %q", xff, last) //nolint:gosec // G706: %q escapes control characters
 		}
+		return addr.Unmap().String(), nil
 	}
+	// No X-Forwarded-For at all means this did not come through the proxy (direct or
+	// local access), so RemoteAddr is the real peer and the right source.
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return "", fmt.Errorf("no usable client address (RemoteAddr=%q): %w", r.RemoteAddr, err)
@@ -665,7 +700,12 @@ func safeReturn(raw string) string {
 	if strings.IndexFunc(raw, func(r rune) bool { return r <= 0x1f || r == 0x7f }) >= 0 {
 		return "/"
 	}
-	return raw
+	// The Apache rule builds the target as path?query unconditionally, so a request
+	// with no query string arrives with a bare "?" on the end. Harmless, but it is
+	// the COMMON case - most challenged requests carry no query - and every one of
+	// them would otherwise show the stray character in the address bar. Only a
+	// trailing "?" with nothing after it goes; a real query is left alone.
+	return strings.TrimSuffix(raw, "?")
 }
 
 // altchaElement renders the widget with contextual escaping.

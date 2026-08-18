@@ -91,8 +91,13 @@ func TestChallengeReadinessFile(t *testing.T) {
 // trusts, which is exactly what makes an open redirect there worth having.
 func TestSafeReturn(t *testing.T) {
 	cases := map[string]string{
-		"/wp-admin":                  "/wp-admin",
-		"/a/b?c=d&e=f":               "/a/b?c=d&e=f",
+		"/wp-admin":    "/wp-admin",
+		"/a/b?c=d&e=f": "/a/b?c=d&e=f",
+		// The Apache rule always builds path?query, so a request with no query
+		// arrives with a bare "?" - trimmed, since it is the common case.
+		"/wp-admin?":                 "/wp-admin",
+		"/search?q=a":                "/search?q=a", // a real query survives
+		"/search?q=a?":               "/search?q=a", // only the trailing one goes
 		"":                           "/",
 		"//evil.example":             "/", // protocol-relative
 		`/\evil.example`:             "/", // some browsers normalise this the same way
@@ -266,10 +271,17 @@ func TestChallengeClientIP(t *testing.T) {
 		{"a client-supplied header cannot displace the appended entry", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "198.51.100.7, 203.0.113.9")
 		}, "203.0.113.9", true},
-		{"falls back to the peer", func(_ *http.Request) {}, "192.0.2.1", true},
-		{"a junk header falls through rather than being trusted", func(r *http.Request) {
+		{"falls back to the peer when there is no XFF at all", func(_ *http.Request) {}, "192.0.2.1", true},
+		// A present-but-unparseable last entry means the proxy is misconfigured, not
+		// that the client can be trusted: fail closed rather than fall back to the
+		// loopback peer, which would key every affected client to 127.0.0.1 and loop
+		// them through the challenge. See B5.
+		{"an unparseable XFF fails closed instead of using the peer", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "not-an-ip")
-		}, "192.0.2.1", true},
+		}, "", false},
+		{"a trailing separator (empty final entry) fails closed", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "203.0.113.9, ")
+		}, "", false},
 		{"IPv4-mapped IPv6 is canonicalised to match %{REMOTE_ADDR}", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "::ffff:203.0.113.9")
 		}, "203.0.113.9", true},
@@ -513,5 +525,57 @@ func TestPassStoreRejectsUnusableKeys(t *testing.T) {
 		if err := store.add(key, time.Now()); err == nil {
 			t.Errorf("add(%q) was accepted; it would corrupt the map", key)
 		}
+	}
+}
+
+// An oversized solve body must be refused before it is parsed, and counted.
+//
+// Without the cap, ParseForm accepts net/http's 10MB default and the token is then
+// base64-decoded, unmarshalled and converted before a length check rejects it -
+// measured at 40MB of allocation for ONE request, on an endpoint that cannot be
+// authenticated. Removing http.MaxBytesReader otherwise survives the whole suite,
+// so this pins both the refusal and the metric: a client hammering the endpoint
+// with unparseable bodies was the one abuse that moved no counter at all.
+func TestChallengeRefusesAnOversizedSolveBody(t *testing.T) {
+	srv, _ := testChallenge(t, nil)
+	body := "altcha=" + strings.Repeat("A", maxSolveBody+(1<<10)) + "&r=/"
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/crowdsec-verify", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Forwarded-For", "203.0.113.9")
+	w := httptest.NewRecorder()
+	srv.handle(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 - an oversized body must be rejected at parse, not carried into the decoder", w.Code)
+	}
+	if got := srv.metrics.solvesRejected.Load(); got != 1 {
+		t.Errorf("challenge_solves_total{result=rejected} = %d, want 1", got)
+	}
+	if got := srv.metrics.solvesErrored.Load(); got != 0 {
+		t.Errorf("an oversized body is a rejection, not a verification error: errored = %d", got)
+	}
+}
+
+// The misrouted-proxy hint must not be burnable on demand. The path that triggers
+// it is client-supplied, so with a sync.Once any caller could spend the one line
+// the process would ever emit - and a real ProxyPass misconfiguration would then
+// never log the message that explains it. Throttled, not one-shot.
+func TestMisroutedHintThrottlesButCannotBeSilenced(t *testing.T) {
+	srv, _ := testChallenge(t, nil)
+	start := time.Now()
+
+	if !srv.shouldLogMisrouted(start) {
+		t.Fatal("the first misrouted request should log")
+	}
+	// A flood in the same window must not fill the log.
+	for i := range 100 {
+		if srv.shouldLogMisrouted(start.Add(time.Duration(i) * time.Second)) {
+			t.Fatalf("hint repeated %s after the last one, inside the %s throttle",
+				time.Duration(i)*time.Second, misroutedEvery)
+		}
+	}
+	// But the operator hitting the real misconfiguration later must still see it.
+	if !srv.shouldLogMisrouted(start.Add(misroutedEvery + time.Second)) {
+		t.Errorf("the hint was silenced for good; it must return after %s", misroutedEvery)
 	}
 }

@@ -548,35 +548,51 @@ func loadConfig() (*config, error) {
 	// Never empty: BOUNCING_ON_TYPE always names at least one remediation this
 	// bouncer can express, and that one always resolves to itself.
 	cfg.remediations = cfg.mapsNeeded()
+	// A challenge listener with nothing routed to it is a no-op, not a reason to
+	// refuse to start. Failing here would freeze ban enforcement over a captcha
+	// misconfiguration - the exact trade loadCaptcha warns against everywhere else -
+	// and it is the state an operator lands in by uncommenting CAPTCHA_LISTEN alone,
+	// the single most obvious step. Warn and switch the listener off instead, so bans
+	// keep updating.
 	if cfg.captchaUsable() && !slices.Contains(cfg.remediations, remediationCaptcha) {
-		return nil, fmt.Errorf("CAPTCHA_LISTEN is set but nothing can reach the captcha map: "+
-			"BOUNCING_ON_TYPE=%s, OVERRIDE_REMEDIATION=%q", cfg.bouncingOnType, cfg.overrideRemediation)
+		log.Printf("WARNING: CAPTCHA_LISTEN=%s is set but no captcha decisions are routed to it "+
+			"(BOUNCING_ON_TYPE=%s, OVERRIDE_REMEDIATION=%q), so the challenge listener will not start. "+
+			"Set BOUNCING_ON_TYPE=all (or =captcha) to enable it.",
+			cfg.captchaListen, cfg.bouncingOnType, cfg.overrideRemediation)
+		cfg.captchaListen = ""
 	}
 	// The pass map must not share a path with anything else this daemon writes:
 	// startChallenge resets it at boot, so a collision truncates whatever file it
-	// lands on. Checked against every rendered map, not just the ban list, and
-	// only after mapsNeeded so the rendered set is the real one. Paths are
-	// Clean()ed so a spelling like dir//file still matches; a symlink does not,
-	// but this guards a config slip, not an adversary.
-	passFile := filepath.Clean(cfg.captchaPassFile)
-	for _, name := range cfg.remediations {
-		txt, dbm := cfg.mapPaths(name)
-		for _, rendered := range []string{txt, dbm} {
-			if passFile != filepath.Clean(rendered) {
-				continue
+	// lands on. Only meaningful while the listener actually runs, so gate on that -
+	// which also skips it when the warning above switched the listener off.
+	if cfg.captchaUsable() {
+		// Checked against every map the daemon can WRITE, not just the ones this
+		// policy renders. retireUnusedMaps still empties a map that used to be
+		// produced, so a pass file pointed at a now-retired map - the ban map under
+		// BOUNCING_ON_TYPE=captcha, say - would otherwise pass this guard and then be
+		// truncated or filled with solver records. knownRemediations is that full set.
+		// Paths are Clean()ed so a spelling like dir//file still matches; a symlink
+		// does not, but this guards a config slip, not an adversary.
+		passFile := filepath.Clean(cfg.captchaPassFile)
+		for _, name := range knownRemediations {
+			txt, dbm := cfg.mapPaths(name)
+			for _, rendered := range []string{txt, dbm} {
+				if passFile != filepath.Clean(rendered) {
+					continue
+				}
+				if name == remediationBan {
+					return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the ban map are both %q; a pass map that overwrites the ban list would unban everyone", rendered)
+				}
+				return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the %s map are both %q; resetting the pass map would empty it until the next poll rebuilds it", name, rendered)
 			}
-			if name == remediationBan {
-				return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the ban map are both %q; a pass map that overwrites the ban list would unban everyone", rendered)
-			}
-			return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the %s map are both %q; resetting the pass map would empty it until the next poll rebuilds it", name, rendered)
 		}
-	}
-	// Custom lists are worse off than the maps: they are operator-maintained, so
-	// nothing would ever rebuild one the reset has truncated.
-	for _, list := range newCustomLists(cfg.customListDir) {
-		for _, kept := range []string{list.txt, list.dbm} {
-			if passFile == filepath.Clean(kept) {
-				return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the custom %s are both %q; the pass map is reset at boot, and nothing rebuilds a truncated custom list", list.name, kept)
+		// Custom lists are worse off than the maps: they are operator-maintained, so
+		// nothing would ever rebuild one the reset has truncated.
+		for _, list := range newCustomLists(cfg.customListDir) {
+			for _, kept := range []string{list.txt, list.dbm} {
+				if passFile == filepath.Clean(kept) {
+					return nil, fmt.Errorf("CAPTCHA_PASS_FILE and the custom %s are both %q; the pass map is reset at boot, and nothing rebuilds a truncated custom list", list.name, kept)
+				}
 			}
 		}
 	}

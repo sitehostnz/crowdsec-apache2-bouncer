@@ -18,6 +18,18 @@ import (
 // below this, so scanning to it always finds the answer.
 const testAltchaComplexity = 2000
 
+// wrongDerivedKey is a WRONG answer of the RIGHT shape: exactly altchaKeyLength
+// bytes of hex, so it survives parseAltchaPayload's length check and actually
+// reaches redeem's comparison.
+//
+// The tests that submit it exist to pin behaviour inside redeem - that a wrong
+// answer leaves the challenge in place. Short junk like "deadbeef" cannot test
+// that: parseAltchaPayload rejects it on length first, so redeem never runs and
+// the test passes even with the guard removed. Verified by mutation - re-adding
+// the delete on redeem's wrong-answer branch fails these tests with this value
+// and passed with the old one.
+var wrongDerivedKey = strings.Repeat("ab", altchaKeyLength)
+
 func testAltchaServer(t *testing.T) (*challengeServer, *passStore) {
 	t.Helper()
 	srv, store := testChallenge(t, func(c *config) {
@@ -180,7 +192,7 @@ func TestAltchaJunkSolveDoesNotForceAFreshMint(t *testing.T) {
 	srv, _ := testAltchaServer(t)
 	first := fetchAltchaChallenge(t, srv, "203.0.113.9")
 	for range 5 {
-		srv.handle(httptest.NewRecorder(), altchaSolveRequest(encodeAltchaPayload("deadbeef"), "/", "203.0.113.9"))
+		srv.handle(httptest.NewRecorder(), altchaSolveRequest(encodeAltchaPayload(wrongDerivedKey), "/", "203.0.113.9"))
 		if got := fetchAltchaChallenge(t, srv, "203.0.113.9"); got.Parameters.KeyPrefix != first.Parameters.KeyPrefix {
 			t.Fatal("a junk solve caused a new challenge to be minted")
 		}
@@ -196,7 +208,7 @@ func TestAltchaNeighbourCannotVoidAnOutstandingChallenge(t *testing.T) {
 
 	// The neighbour (or a bot at the same address) submits rubbish repeatedly.
 	for range 3 {
-		srv.handle(httptest.NewRecorder(), altchaSolveRequest(encodeAltchaPayload("00"), "/", "203.0.113.9"))
+		srv.handle(httptest.NewRecorder(), altchaSolveRequest(encodeAltchaPayload(wrongDerivedKey), "/", "203.0.113.9"))
 	}
 	// The visitor finishes their grind and must still get through.
 	w := httptest.NewRecorder()
@@ -391,5 +403,64 @@ func TestAltchaMisroutedChallengePathIsRefused(t *testing.T) {
 		if w.Code != http.StatusNotFound {
 			t.Errorf("%s returned %d, want 404 - a 200 here is the silent hang", path, w.Code)
 		}
+	}
+}
+
+// Re-fetching must not let one address hold its slot forever. Extension is capped
+// at altchaMaxLifetime from the mint; without that cap a visitor (or a bot)
+// reloading just before each expiry pushes the entry out another TTL every time,
+// and at altchaMaxLive that locks every new client out.
+//
+// This pins the clamp itself: removing it survives the rest of the suite.
+func TestAltchaExtensionIsCappedAtMaxLifetime(t *testing.T) {
+	s := newAltchaStore()
+	start := time.Now()
+	const ip = "203.0.113.9"
+	if _, err := s.challengeFor(ip, altchaDefaultAlgorithm, 1, testAltchaComplexity, start); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	first := s.live[ip]
+	s.mu.Unlock()
+
+	now := start
+	for range 10 {
+		// Just before the current expiry, which is what a reload looks like.
+		now = now.Add(altchaChallengeTTL - time.Minute)
+		if _, err := s.challengeFor(ip, altchaDefaultAlgorithm, 1, testAltchaComplexity, now); err != nil {
+			t.Fatal(err)
+		}
+		s.mu.Lock()
+		e, live := s.live[ip]
+		s.mu.Unlock()
+		if !live {
+			t.Fatal("the entry vanished while it was still being re-fetched")
+		}
+		if e.key != first.key {
+			return // aged out and re-minted, which is the cap doing its job
+		}
+		if limit := first.created.Add(altchaMaxLifetime); e.expires.After(limit) {
+			t.Fatalf("re-fetching pushed the expiry to mint+%s, past the %s cap",
+				e.expires.Sub(first.created), altchaMaxLifetime)
+		}
+	}
+}
+
+// The salt must be at least 128 bits. FIPS 140-only mode refuses a shorter PBKDF2
+// salt, and with the default algorithm that turns every mint into a 500 - no
+// visitor on a FIPS-hardened host could obtain a challenge at all. Shrinking it
+// back to 12 bytes otherwise survives the whole suite.
+func TestAltchaSaltMeetsTheFIPSMinimum(t *testing.T) {
+	e, err := newAltchaChallenge(altchaDefaultAlgorithm, 1, testAltchaComplexity, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt, err := hex.DecodeString(e.publish().Parameters.Salt)
+	if err != nil {
+		t.Fatalf("published salt is not hex: %v", err)
+	}
+	if len(salt) < 16 {
+		t.Errorf("salt is %d bytes (%d bits); FIPS 140 refuses a PBKDF2 salt under 16 (128 bits)",
+			len(salt), len(salt)*8)
 	}
 }
