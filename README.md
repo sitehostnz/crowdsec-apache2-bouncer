@@ -478,6 +478,18 @@ the most an address-hopping flood can pin is ~37 MiB — the refusal is logged, 
 `altcha_challenges_minted_total` on `/metrics` is the rate an abuser would be
 driving up.
 
+**Rate limit it at Apache.** Everything above bounds the work per *address* and the
+memory in total; **nothing in the daemon bounds the request rate**, so an
+address-hopping flood still drives one mint per fresh address. That last bound
+belongs at the layer that already terminates the connection, and it is recommended
+wherever you enable captcha — option 5 in `apache/blocklist.conf` ships a
+`mod_evasive` block and an `iptables hashlimit` line, both commented out, scoped to
+`/crowdsec-verify`. Keep the limit loose enough that a real visitor can still load
+the page and fetch one challenge — a solve is one page `GET`, one challenge `GET`
+and one `POST`, so a few requests per second per address is ample. Too tight and the
+captcha becomes a block. `altcha_challenges_minted_total` is what tells you whether
+any of this is needed.
+
 **What a pass is keyed on.** The solver's address, matching CrowdSec's own nginx
 bouncer, so the Apache side is a plain map lookup identical to the ban list. One
 solver therefore lets through every browser at that address — everyone behind the
@@ -487,6 +499,26 @@ Cookie keying would be the more correct answer under NAT, and was removed: the
 daemon minted the token but nothing else was finished, so setting it produced a
 daemon that recorded cookies while Apache matched addresses, re-challenging every
 visitor forever. Better absent than half-present.
+
+**A pass can be obtained before you are challenged, and that is intended.** The
+challenge endpoint has to be reachable by everyone — a challenged client could not
+otherwise get to it — and it does not check whether the caller is currently under a
+captcha decision. So anyone can solve at any time and hold a pass for
+`CAPTCHA_PASS_TTL`, including before CrowdSec has flagged them at all.
+
+Read plainly: **a captcha here is a per-address toll of one proof-of-work per TTL,
+not a gate that fires the moment you are flagged.** Solving in advance costs an
+attacker exactly what solving on demand does — one proof per address per hour at the
+default — so it buys no discount, only the choice of when to pay. It grants nothing
+else: a pass never bypasses a **ban** (the block rule ignores the pass map
+entirely), and it only ever exempts the address that solved.
+
+The lever that matters is therefore the toll itself, not the timing — `ALTCHA_COST`
+and `ALTCHA_COMPLEXITY` for how much each solve costs, and `CAPTCHA_PASS_TTL` for
+how long it buys. Shorten the TTL if you want the toll paid more often. (CrowdSec's
+nginx bouncer serves its captcha inline as the remediation, so there the endpoint
+cannot be pre-solved; the trade here is a standalone endpoint that any vhost can
+proxy to without embedding the challenge in every one.)
 
 **Failure behaviour is fail-closed throughout.** A token that is missing, malformed,
 wrong, expired or already spent leaves the client challenged — a fault in the check
@@ -500,6 +532,16 @@ would name clients with no expiry and stay valid forever.
 
 The package ships these rules in `apache/blocklist.conf`, which is the copy to
 edit — it carries the full commentary and is what the walkthrough above installs.
+
+> ⚠️ **The captcha rules ship commented out.** Only the plain ban rule is active in
+> the file as installed. Enabling captcha is two halves and *both* are required: set
+> `BOUNCING_ON_TYPE=all` (or `captcha`) and `CAPTCHA_LISTEN` on the daemon, **and**
+> uncomment the captcha block in `apache/blocklist.conf`, replacing the single block
+> rule above it. Do only the daemon half and everything looks healthy — `captcha.txt`
+> fills up correctly and the daemon logs normally — while Apache never consults the
+> map and not one visitor is ever challenged. Nothing warns you, because from the
+> daemon's side nothing is wrong.
+
 Reproduced here so the shape is visible without a checkout:
 
 ```apache
@@ -520,7 +562,9 @@ RewriteCond ${solved:%{REMOTE_ADDR}|0}  !=1
 RewriteCond ${captcha:%{REMOTE_ADDR}|0}  =1
 RewriteCond %{HTTP_ACCEPT} text/html
 RewriteCond /run/crowdsec-apache2-bouncer/challenge.up -f
-RewriteRule ^ /crowdsec-verify?r=%{REQUEST_URI} [R=302,L]
+# LAST cond: %1 below comes from it. Always matches; it captures, it doesn't filter.
+RewriteCond %{REQUEST_URI}?%{QUERY_STRING} ^(.*)$
+RewriteRule ^ /crowdsec-verify?r=%1 [B,R=302,L,NE]
 
 # Anything else from a challenged client - and everything, once the daemon is
 # down - is refused rather than redirected.
@@ -549,7 +593,7 @@ it and is ignored. There is no header to set.
 > wrote — and anyone can record a pass against an address they don't control. The
 > daemon can't detect it: through the proxy the peer is loopback either way.
 
-Three things there are not obvious, and each is a failure that has been hit rather
+Four things there are not obvious, and each is a failure that has been hit rather
 than a precaution:
 
 1. **`%{ENV:REDIRECT_STATUS} ^$` — act only on the original request.**
@@ -570,6 +614,17 @@ than a precaution:
    the challenge itself from being challenged. It exempts exactly what `ProxyPass`
    forwards to the listener and no more — a broader `!^/crowdsec-` would let a
    banned client reach the vhost on any other `/crowdsec-*` path.
+4. **`[B,NE]` on the challenge redirect, and the capture cond above it.** The
+   return target rides inside `r=`, so every character that means something in a
+   query string has to be encoded — otherwise the customer's own query breaks out
+   of the parameter and `/search?q=a&b=c` arrives as `r=/search?q=a` plus a stray
+   `b=c`. The last `RewriteCond` captures `path?query` into `%1`, `[B]` escapes
+   that backreference (`&`, `=`, `+`, `?` all become `%XX`), and `[NE]` stops
+   Apache re-encoding the `%` signs into `%25`. Don't reach for `${escape:…}`
+   here — it's an escaper for URI *paths* and leaves `&`, `=` and `+` alone, which
+   is the bug this replaces. Verified on Apache 2.4.62 (AlmaLinux) and 2.4.68
+   (Debian). With no query string the target ends in a bare `?`, which the daemon
+   trims.
 
 Add the allowlist guard (`RewriteCond ${local_allow:%{REMOTE_ADDR}|0} !=1`) to the
 block *and* challenge rules if you use the local lists — the same rule as

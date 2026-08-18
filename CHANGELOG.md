@@ -102,6 +102,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   markup is rendered once at startup rather than on every page. Benchmarks for the
   whole path live in `profile_test.go`, and the README's challenge-listener
   section carries the numbers. ([#2])
+- `CAPTCHA_PASS_FILE`, `CAPTCHA_READY_FILE`, `METRICS_LISTEN` and `METRICS_PATH`
+  now appear in the packaged config file. All four were read by the daemon and
+  documented nowhere, so the only way to discover them was the source. ([#7])
+- The README states plainly that **the captcha Apache rules ship commented out**.
+  Doing only the daemon half of the setup looks completely healthy — the map fills
+  up, the logs are clean — while Apache never consults it and nobody is ever
+  challenged. ([#7])
+- The README documents that a pass can be obtained **before** being flagged, and
+  what that does and does not mean: the captcha is a per-address toll of one
+  proof-of-work per `CAPTCHA_PASS_TTL`, it never bypasses a ban, and solving early
+  costs an attacker exactly what solving on demand does. The levers are the cost
+  dials and the TTL, not the timing. ([#7])
+- `apache/blocklist.conf` ships a commented **rate-limit** option for the challenge
+  endpoint (`mod_evasive` and an `iptables hashlimit` form), with the README
+  explaining why it belongs at Apache: the daemon bounds work per address and
+  memory in total, but nothing in it bounds the request rate. ([#7])
+- `apache/blocklist.conf` ships a commented option for **self-hosting the widget
+  script**. A `<script type="module">` request sends `Accept: */*`, which does not
+  match the `text/html` cond, so a self-hosted asset fell through to the refuse
+  rule and was 403'd for exactly the clients that needed it. Only relevant if you
+  repoint `CAPTCHA_WIDGET_JS`; the default CDN build is unaffected. ([#7])
+
+### Fixed
+
+- **Setting `CAPTCHA_LISTEN` on its own is no longer a fatal startup error.**
+  Uncommenting it — the most obvious step when enabling captcha — left nothing
+  routing captcha under the shipped `BOUNCING_ON_TYPE=ban`, and the daemon refused
+  to start at all. That contradicted the rule the rest of the captcha config
+  follows: a captcha misconfiguration must never take ban enforcement down. The
+  listener is now switched off with a warning naming the setting to change, and
+  bans keep updating. ([#7])
+- **The pass-map collision guard now covers retired maps.** It checked only the
+  maps the current policy renders, so under `BOUNCING_ON_TYPE=captcha` the ban map
+  was invisible to it: pointing `CAPTCHA_PASS_FILE` at `blocklist.txt` was accepted
+  and the boot-time pass reset then overwrote the ban list. It now checks every map
+  the daemon can write, and only while the challenge listener is actually on.
+  ([#7])
+- **An unparseable `X-Forwarded-For` no longer keys every client to loopback.** The
+  last entry is the one `mod_proxy` appends and the only trustworthy one; when it
+  would not parse the daemon fell back to `RemoteAddr`, which behind the proxy is
+  `127.0.0.1`. Every affected client then shared one identity that no
+  `%{REMOTE_ADDR}` lookup could match, so no pass ever took and the browser looped
+  through the challenge. It now fails closed with a 400 naming the header, which
+  surfaces the proxy misconfiguration instead of hiding it. A request with no
+  `X-Forwarded-For` at all still uses the peer, as before. ([#7])
+- **The challenge redirect preserves the query string.** `%{REQUEST_URI}` is the
+  path alone, so a visitor challenged on `/search?q=hello` was returned to
+  `/search`. The shipped rule now captures `path?query` in a `RewriteCond` and
+  escapes it with `[B,NE]`, so `&`, `=`, `+` and `?` are encoded into the one `r`
+  parameter instead of breaking out of it. (`${escape:…}` does not work here: it
+  is an escaper for URI *paths* and leaves `&`, `=` and `+` untouched — measured
+  on Apache 2.4.62 and 2.4.68, both families.) `safeReturn` trims the bare
+  trailing `?` the rule produces when there is no query string. ([#7])
+- The proxy-misconfiguration hint is throttled rather than one-shot. The path that
+  triggers it is client-supplied, so any caller could burn the single line the
+  process would ever log and leave a genuine `ProxyPass` mistake unexplained. It
+  now repeats at most every 10 minutes, and names `CAPTCHA_PATH` rather than
+  assuming the default. ([#7])
 
 ### Removed
 
@@ -225,3 +283,4 @@ an Apache `RewriteMap`, so banned traffic is turned away by Apache itself.
 [#1]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/pull/1
 [#2]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/2
 [#6]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/6
+[#7]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/pull/7
