@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -577,5 +578,36 @@ func TestMisroutedHintThrottlesButCannotBeSilenced(t *testing.T) {
 	// But the operator hitting the real misconfiguration later must still see it.
 	if !srv.shouldLogMisrouted(start.Add(misroutedEvery + time.Second)) {
 		t.Errorf("the hint was silenced for good; it must return after %s", misroutedEvery)
+	}
+}
+
+// The wire form Apache actually sends, not just the decoded string. The challenge
+// redirect escapes the return target with [B], so an attacker-supplied %0d%0a in
+// the request URI survives Apache as a literal %0d%0a in r= and only becomes CR/LF
+// when the daemon decodes the parameter - which is exactly where safeReturn has to
+// catch it. Apache answers these with a 302 rather than refusing them, so this
+// guard is load-bearing rather than belt-and-braces.
+//
+// The r values here were captured from a live Apache 2.4.68 running the shipped
+// rule block, not hand-written.
+func TestReturnParamFromApacheIsNeutralised(t *testing.T) {
+	cases := map[string]struct{ raw, want string }{
+		"CRLF header injection":                  {"%2fa%0d%0aSet%2dCookie%3ax%3dy%3f", "/"},
+		"tab, which browsers strip out of a URL": {"%2fa%09b%3f", "/"},
+		// Not everything unusual is hostile: these must still round-trip.
+		"multi-param query":      {"%2fwp%2dadmin%3fa%3d1%26b%3d2%26c%3d3", "/wp-admin?a=1&b=2&c=3"},
+		"plus in path and query": {"%2fa%2bb%3fq%3dc%2bd", "/a+b?q=c+d"},
+		"no query at all":        {"%2fwp%2dadmin%3f", "/wp-admin"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			v, err := url.ParseQuery("r=" + c.raw)
+			if err != nil {
+				t.Fatalf("Apache sent something net/http cannot parse: %v", err)
+			}
+			if got := safeReturn(v.Get("r")); got != c.want {
+				t.Errorf("safeReturn(%q) = %q, want %q", v.Get("r"), got, c.want)
+			}
+		})
 	}
 }
