@@ -157,31 +157,46 @@ func (c *config) loadCaptcha(dir string) error {
 		}
 	}
 	{
-		// Lower-cased so an operator writing "pbkdf2/sha-256" is spelling it the way
-		// a config file usually looks rather than making a mistake.
+		// A bad ALTCHA dial falls back to the shipped default, loudly, instead of
+		// refusing to start. Refusal was the original choice - the browser-side
+		// failure is a page that spins until the widget's 90s timeout with nothing
+		// logged here, the failure hardest to diagnose from the outside - but dying
+		// over a captcha dial takes ban enforcement down with it, which is the one
+		// trade this file never makes. The defaults keep the challenge solvable at a
+		// cost the operator did not choose, and the WARNING says exactly what moved;
+		// serve's startup line then prints the dials actually in force.
+		//
+		// Lower-cased first, so an operator writing "pbkdf2/sha-256" is spelling it
+		// the way a config file usually looks rather than making a mistake.
 		c.altchaAlgorithm = canonicalAltchaAlgorithm(c.altchaAlgorithm)
 		if _, ok := altchaAlgorithms[c.altchaAlgorithm]; !ok {
-			return fmt.Errorf("ALTCHA_ALGORITHM: %q is not one the widget can solve; want one of %s",
-				c.altchaAlgorithm, strings.Join(altchaAlgorithmNames(), ", "))
+			log.Printf("WARNING: ALTCHA_ALGORITHM=%q is not one the widget can solve (want one of %s); using the default %s",
+				c.altchaAlgorithm, strings.Join(altchaAlgorithmNames(), ", "), altchaDefaultAlgorithm)
+			c.altchaAlgorithm = altchaDefaultAlgorithm
 		}
-		// ALTCHA_COST means something different per family, so the two dials have to
-		// be judged together and against the widget's timeout - not against each
-		// other. Refused rather than warned: a configuration past this point produces
-		// a page that spins until the widget gives up, with nothing logged here,
-		// which is the failure mode hardest to diagnose from the outside.
-		if calls := altchaWebCryptoCalls(c.altchaAlgorithm, c.altchaCost, c.altchaComplexity); calls > altchaMaxWebCryptoCalls {
-			return fmt.Errorf("ALTCHA_ALGORITHM=%s with ALTCHA_COST=%d and ALTCHA_COMPLEXITY=%d asks the browser for ~%d WebCrypto calls, past the ~%d it can make before the widget's 90s timeout; "+
-				"the plain SHA family spends one awaited call per iteration, so lower ALTCHA_COST (PBKDF2 keeps its iterations inside one call)",
-				c.altchaAlgorithm, c.altchaCost, c.altchaComplexity, calls, altchaMaxWebCryptoCalls)
-		}
-		// Call count alone misses PBKDF2 entirely, where cost is spent INSIDE one
-		// call: ALTCHA_COST=100000 reported 15,000 calls and sailed through while
-		// actually asking for 500,000,000 iterations and raising every mint we
-		// perform from 730us to 16ms. Total work has to be bounded too.
-		if iter := c.altchaComplexity / 2 * int64(c.altchaCost); iter > altchaMaxIterations {
-			return fmt.Errorf("ALTCHA_COST=%d with ALTCHA_COMPLEXITY=%d asks for ~%d KDF iterations per solve, past the ~%d a browser finishes in the widget's 90s timeout - "+
-				"and every challenge WE mint pays ALTCHA_COST of them too, on an endpoint that cannot be authenticated",
-				c.altchaCost, c.altchaComplexity, iter, altchaMaxIterations)
+		// The two dials are judged together, per family, against the widget's
+		// timeout. ALTCHA_COST means something different per family: the plain SHA
+		// family spends one awaited WebCrypto call per iteration, where PBKDF2 keeps
+		// its iterations inside one call - which is also why the call count alone
+		// misses PBKDF2 entirely (ALTCHA_COST=100000 reported 15,000 calls while
+		// asking for 500,000,000 iterations, raising every mint WE perform from
+		// 730us to 16ms), so the total work is bounded too.
+		//
+		// A violation resets ALL THREE dials, not just the offender: the defaults
+		// are only known-solvable as a set - the default cost and complexity under
+		// plain SHA-256 still exceed the call budget - and a partial reset could
+		// land on another unsolvable combination.
+		calls := altchaWebCryptoCalls(c.altchaAlgorithm, c.altchaCost, c.altchaComplexity)
+		iterations := c.altchaComplexity / 2 * int64(c.altchaCost)
+		if calls > altchaMaxWebCryptoCalls || iterations > altchaMaxIterations {
+			log.Printf("WARNING: ALTCHA_ALGORITHM=%s with ALTCHA_COST=%d and ALTCHA_COMPLEXITY=%d asks the browser for ~%d WebCrypto calls and ~%d KDF iterations per solve, "+
+				"more than it can finish inside the widget's 90s timeout (bounds: ~%d calls, ~%d iterations); using the defaults %s cost=%d complexity=%d",
+				c.altchaAlgorithm, c.altchaCost, c.altchaComplexity, calls, iterations,
+				altchaMaxWebCryptoCalls, altchaMaxIterations,
+				altchaDefaultAlgorithm, altchaDefaultCost, altchaDefaultComplexity)
+			c.altchaAlgorithm = altchaDefaultAlgorithm
+			c.altchaCost = altchaDefaultCost
+			c.altchaComplexity = altchaDefaultComplexity
 		}
 		// The pass-file collision check lives in loadConfig rather than here: it has
 		// to compare against every map the daemon renders, and which maps those are
@@ -189,9 +204,11 @@ func (c *config) loadCaptcha(dir string) error {
 		// function is still reading.
 		// A malformed digest is worse than none at all: the browser refuses the
 		// script, the element never upgrades, and the page sits on "Verifying your
-		// connection" with nothing wrong in the markup and nothing logged here. Same
-		// silent hang the MIME fault produced, so it is refused at startup for the
-		// same reason ALTCHA_ALGORITHM is.
+		// connection" with nothing wrong in the markup and nothing logged here - the
+		// same silent hang the MIME fault produced. This one stays FATAL where the
+		// ALTCHA dials fall back to defaults, because there is no safe default to
+		// fall back TO: the digest belongs to whatever CAPTCHA_WIDGET_JS names, and
+		// substituting or dropping it would silently un-verify an operator's script.
 		if c.captchaWidgetSRI != "" && !validSRI(c.captchaWidgetSRI) {
 			return fmt.Errorf("CAPTCHA_WIDGET_SRI=%q is not a subresource integrity digest. Want a single lowercase sha256-, sha384- or sha512- "+
 				"followed by that hash's base64, at its full length (%d, %d or %d bytes) - a hash of the wrong size for the name in front of it "+
@@ -555,12 +572,14 @@ func loadConfig() (*config, error) {
 	// the single most obvious step. Warn and switch the listener off instead, so bans
 	// keep updating.
 	//
-	// The boundary is deliberate: ROUTING mismatches degrade (this check), but
-	// malformed captcha VALUES stay fatal in loadCaptcha above even when nothing
-	// routes captcha - an unknown ALTCHA_ALGORITHM, a work budget no browser can
-	// finish, a removed provider setting. A typo is a mistake to surface at the
-	// operator's terminal, not a policy to quietly degrade around; deferring it to
-	// the day the routing is finally enabled would surface it at the worst time.
+	// The boundary is deliberate. What degrades: a ROUTING mismatch switches the
+	// listener off (this check), and a bad ALTCHA dial falls back to the shipped
+	// defaults (loadCaptcha above) - in both cases with a WARNING, and bans keep
+	// updating. What stays fatal: config that would run while doing something other
+	// than it says - a removed Cap provider setting (a half-migrated config must
+	// not start cleanly), a malformed CAPTCHA_WIDGET_SRI (the browser would refuse
+	// the widget for every visitor, silently), and a pass-file collision (the boot
+	// reset would truncate a live map).
 	if cfg.captchaUsable() && !slices.Contains(cfg.remediations, remediationCaptcha) {
 		log.Printf("WARNING: CAPTCHA_LISTEN=%s is set but no captcha decisions are routed to it "+
 			"(BOUNCING_ON_TYPE=%s, OVERRIDE_REMEDIATION=%q), so the challenge listener will not start. "+

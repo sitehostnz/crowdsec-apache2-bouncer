@@ -438,12 +438,14 @@ because redeeming removes the challenge, a solution cannot be replayed.
 
 | | Default | |
 |---|---|---|
-| `ALTCHA_ALGORITHM` | `PBKDF2/SHA-256` | also `SHA-256/384/512`, `PBKDF2/SHA-384`, `PBKDF2/SHA-512`. An unknown name is refused at startup |
+| `ALTCHA_ALGORITHM` | `PBKDF2/SHA-256` | also `SHA-256/384/512`, `PBKDF2/SHA-384`, `PBKDF2/SHA-512`. An unknown name falls back to the default, with a startup warning |
 | `ALTCHA_COST` | `5000` | iterations per attempt |
 | `ALTCHA_COMPLEXITY` | `5000` | attempts the visitor makes; they expect to try half |
 
-The two multiply, and the daemon refuses a combination a browser cannot finish
-inside the widget's 90-second timeout — it prints the estimate at startup. Prefer
+The two multiply, and a combination a browser cannot finish inside the widget's
+90-second timeout makes the daemon fall back to **all three defaults** with a
+startup warning — never a refusal to start, since that would take ban enforcement
+down over a captcha dial. It prints the estimate at startup either way. Prefer
 raising complexity: it costs the visitor alone, where cost is also paid once per
 challenge the daemon mints. Together the defaults are ~12.5M iterations, a second or
 two in a browser — half what the nginx bouncer asks for, which uses the same cost

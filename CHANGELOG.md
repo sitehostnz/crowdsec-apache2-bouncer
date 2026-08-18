@@ -48,11 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   > `FALLBACK_REMEDIATION=ban`.
 
 - `ALTCHA_ALGORITHM` (default `PBKDF2/SHA-256`), `ALTCHA_COST` (`5000`) and
-  `ALTCHA_COMPLEXITY` (`5000`) tune the check. Only names the published widget can
-  solve are accepted, and a combination a browser could not finish inside the
-  widget's 90-second timeout is refused at startup rather than left to spin in
-  somebody's browser. The defaults match the nginx bouncer's cost, so a visitor
-  meets a comparable check on either. ([#2])
+  `ALTCHA_COMPLEXITY` (`5000`) tune the check. An unknown algorithm, or a
+  combination a browser could not finish inside the widget's 90-second timeout,
+  falls back to the shipped defaults with a startup warning rather than being left
+  to spin in somebody's browser — or taking the daemon (and ban enforcement) down.
+  The defaults match the nginx bouncer's cost, so a visitor meets a comparable
+  check on either. ([#2])
 - `crowdsec_apache_bouncer_altcha_challenges`,
   `..._altcha_challenges_expired_total` and `..._altcha_challenges_minted_total` —
   the challenges outstanding, abandoned and derived. Minting is the only work an
@@ -134,11 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to start at all. That contradicted the rule the rest of the captcha config
   follows: a captcha misconfiguration must never take ban enforcement down. The
   listener is now switched off with a warning naming the settings to change, and
-  bans keep updating. The boundary is deliberate: routing mismatches degrade,
-  while malformed captcha *values* — an unknown `ALTCHA_ALGORITHM`, a work budget
-  no browser can finish, a removed provider setting — are still refused at
-  startup, so a typo surfaces at the terminal rather than on the day the routing
-  is finally enabled. ([#7])
+  bans keep updating. Bad `ALTCHA_*` values degrade the same way: an unknown
+  algorithm or an unsolvable cost/complexity combination falls back to the shipped
+  defaults with a warning instead of refusing to start. What stays fatal is config
+  that would run while doing something other than it says: a removed Cap provider
+  setting, a malformed `CAPTCHA_WIDGET_SRI`, and a pass-file collision. ([#7])
 - **The pass-map collision guard now covers retired maps.** It checked only the
   maps the current policy renders, so under `BOUNCING_ON_TYPE=captcha` the ban map
   was invisible to it: pointing `CAPTCHA_PASS_FILE` at `blocklist.txt` was accepted

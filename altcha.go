@@ -75,7 +75,8 @@ import (
 // calls per candidate - so at the shipped defaults it asks for ~12,500,000 WebCrypto
 // calls against PBKDF2's ~7,500. Per-call overhead dominates, the widget's own 90s
 // timeout fires, and solveChallenge returns null with no error: the silent hang
-// again. altchaWebCryptoCalls exists to refuse that at startup.
+// again. altchaWebCryptoCalls exists to catch that at startup, where loadCaptcha
+// falls back to the shipped defaults rather than shipping an unsolvable page.
 //
 // The longer digests are not "stronger" here either - the work is the search, not
 // the hash. They are faster per byte on 64-bit hardware, so within the PLAIN family

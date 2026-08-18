@@ -744,10 +744,12 @@ func TestCaptchaListenWithNoRoutingDegradesInsteadOfFailing(t *testing.T) {
 	}
 }
 
-// The three ALTCHA refusals exist because each produces a page that spins until the
-// widget's 90s timeout with nothing logged on our side - the failure hardest to
-// diagnose from the outside. None of them was covered.
-func TestAltchaSettingsRefusedAtStartup(t *testing.T) {
+// The three ALTCHA guards exist because each bad value produces a page that spins
+// until the widget's 90s timeout with nothing logged on our side - the failure
+// hardest to diagnose from the outside. They fall back to the shipped defaults
+// with a warning rather than refusing to start: dying over a captcha dial would
+// take ban enforcement down with it. None of this was covered before.
+func TestAltchaSettingsFallBackToTheDefaults(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Helper()
 		clearEnv(t)
@@ -755,44 +757,82 @@ func TestAltchaSettingsRefusedAtStartup(t *testing.T) {
 		t.Setenv("BOUNCING_ON_TYPE", "all")
 		t.Setenv("CAPTCHA_LISTEN", "127.0.0.1:8125")
 	}
+	wantDefaults := func(t *testing.T, cfg *config) {
+		t.Helper()
+		if cfg.altchaAlgorithm != altchaDefaultAlgorithm ||
+			cfg.altchaCost != altchaDefaultCost ||
+			cfg.altchaComplexity != altchaDefaultComplexity {
+			t.Fatalf("want the shipped defaults, got %s cost=%d complexity=%d",
+				cfg.altchaAlgorithm, cfg.altchaCost, cfg.altchaComplexity)
+		}
+	}
 
-	t.Run("an algorithm the widget cannot solve", func(t *testing.T) {
+	t.Run("an algorithm the widget cannot solve falls back", func(t *testing.T) {
 		base(t)
 		t.Setenv("ALTCHA_ALGORITHM", "argon2id")
-		if _, err := loadConfig(); err == nil {
-			t.Fatal("an unknown ALTCHA_ALGORITHM must be refused: the widget throws before doing any work")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("an unknown ALTCHA_ALGORITHM must not be fatal: %v", err)
+		}
+		if cfg.altchaAlgorithm != altchaDefaultAlgorithm {
+			t.Fatalf("algorithm = %q, want the default %q", cfg.altchaAlgorithm, altchaDefaultAlgorithm)
 		}
 	})
 
 	// The plain family spends one awaited crypto.subtle call per iteration, so cost
 	// multiplies the CALL count - the dial that decides whether a browser can finish.
-	t.Run("more WebCrypto calls than a browser can make", func(t *testing.T) {
+	// All THREE dials must reset, not just the offenders: the default cost and
+	// complexity under plain SHA-256 still exceed the call budget on their own.
+	t.Run("more WebCrypto calls than a browser can make resets every dial", func(t *testing.T) {
 		base(t)
 		t.Setenv("ALTCHA_ALGORITHM", "SHA-256")
 		t.Setenv("ALTCHA_COMPLEXITY", "20000")
 		t.Setenv("ALTCHA_COST", "1000")
-		if _, err := loadConfig(); err == nil {
-			t.Fatal("a combination past altchaMaxWebCryptoCalls must be refused")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("a combination past altchaMaxWebCryptoCalls must not be fatal: %v", err)
 		}
+		wantDefaults(t, cfg)
 	})
 
 	// PBKDF2 hides its cost inside one call, so the call count cannot see it: total
 	// iterations have to be bounded separately, or ALTCHA_COST=100000 sails through
 	// while asking for 500M iterations and raising every mint WE perform to ~16ms.
-	t.Run("more total iterations than a browser can finish", func(t *testing.T) {
+	t.Run("more total iterations than a browser can finish resets every dial", func(t *testing.T) {
 		base(t)
 		t.Setenv("ALTCHA_ALGORITHM", "PBKDF2/SHA-256")
 		t.Setenv("ALTCHA_COMPLEXITY", "10000")
 		t.Setenv("ALTCHA_COST", "100000")
-		if _, err := loadConfig(); err == nil {
-			t.Fatal("a combination past altchaMaxIterations must be refused")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("a combination past altchaMaxIterations must not be fatal: %v", err)
+		}
+		wantDefaults(t, cfg)
+	})
+
+	// The guard must not clobber values that are merely unusual. These are valid -
+	// ~9,000 WebCrypto calls, ~24M iterations - so they have to survive untouched.
+	t.Run("valid non-default dials are honoured", func(t *testing.T) {
+		base(t)
+		t.Setenv("ALTCHA_ALGORITHM", "pbkdf2/sha-512") // case-insensitive spelling too
+		t.Setenv("ALTCHA_COMPLEXITY", "6000")
+		t.Setenv("ALTCHA_COST", "8000")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.altchaAlgorithm != "PBKDF2/SHA-512" || cfg.altchaCost != 8000 || cfg.altchaComplexity != 6000 {
+			t.Fatalf("valid dials were changed: %s cost=%d complexity=%d",
+				cfg.altchaAlgorithm, cfg.altchaCost, cfg.altchaComplexity)
 		}
 	})
 
 	t.Run("the shipped defaults are accepted", func(t *testing.T) {
 		base(t)
-		if _, err := loadConfig(); err != nil {
+		cfg, err := loadConfig()
+		if err != nil {
 			t.Fatalf("the defaults must load: %v", err)
 		}
+		wantDefaults(t, cfg)
 	})
 }
