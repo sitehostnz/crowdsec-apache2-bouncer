@@ -554,10 +554,17 @@ func loadConfig() (*config, error) {
 	// and it is the state an operator lands in by uncommenting CAPTCHA_LISTEN alone,
 	// the single most obvious step. Warn and switch the listener off instead, so bans
 	// keep updating.
+	//
+	// The boundary is deliberate: ROUTING mismatches degrade (this check), but
+	// malformed captcha VALUES stay fatal in loadCaptcha above even when nothing
+	// routes captcha - an unknown ALTCHA_ALGORITHM, a work budget no browser can
+	// finish, a removed provider setting. A typo is a mistake to surface at the
+	// operator's terminal, not a policy to quietly degrade around; deferring it to
+	// the day the routing is finally enabled would surface it at the worst time.
 	if cfg.captchaUsable() && !slices.Contains(cfg.remediations, remediationCaptcha) {
 		log.Printf("WARNING: CAPTCHA_LISTEN=%s is set but no captcha decisions are routed to it "+
 			"(BOUNCING_ON_TYPE=%s, OVERRIDE_REMEDIATION=%q), so the challenge listener will not start. "+
-			"Set BOUNCING_ON_TYPE=all (or =captcha) to enable it.",
+			"Set BOUNCING_ON_TYPE=all (or =captcha), and clear any OVERRIDE_REMEDIATION that routes captcha elsewhere, to enable it.",
 			cfg.captchaListen, cfg.bouncingOnType, cfg.overrideRemediation)
 		cfg.captchaListen = ""
 	}

@@ -478,17 +478,18 @@ the most an address-hopping flood can pin is ~37 MiB — the refusal is logged, 
 `altcha_challenges_minted_total` on `/metrics` is the rate an abuser would be
 driving up.
 
-**Rate limit it at Apache.** Everything above bounds the work per *address* and the
-memory in total; **nothing in the daemon bounds the request rate**, so an
+**There is no request-rate limit yet.** Everything above bounds the work per
+*address* and the memory in total; **nothing bounds the request rate**, so an
 address-hopping flood still drives one mint per fresh address. That last bound
-belongs at the layer that already terminates the connection, and it is recommended
-wherever you enable captcha — option 5 in `apache/blocklist.conf` ships a
-`mod_evasive` block and an `iptables hashlimit` line, both commented out, scoped to
-`/crowdsec-verify`. Keep the limit loose enough that a real visitor can still load
+belongs at a layer that can see the connection — Apache or the firewall — and a
+verified recipe is tracked in
+[#9](https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/9). (An earlier
+draft shipped `mod_evasive` and `iptables hashlimit` examples; both turned out to be
+unsafe to copy-paste and were pulled — the details are on the issue.) If you add
+your own in the meantime, keep it loose enough that a real visitor can still load
 the page and fetch one challenge — a solve is one page `GET`, one challenge `GET`
-and one `POST`, so a few requests per second per address is ample. Too tight and the
-captcha becomes a block. `altcha_challenges_minted_total` is what tells you whether
-any of this is needed.
+and one `POST`. `altcha_challenges_minted_total` is what tells you whether any of
+this is needed.
 
 **What a pass is keyed on.** The solver's address, matching CrowdSec's own nginx
 bouncer, so the Apache side is a plain map lookup identical to the ban list. One
@@ -653,7 +654,8 @@ challenge fetch at `<CAPTCHA_PATH>/altcha-challenge`. Then change the **same pat
 in every Apache rule that names it, all in the block above:
 
 - the `ProxyPass` and `ProxyPassReverse` targets
-- the redirect target — `RewriteRule ^ /verify?r=%{REQUEST_URI} …`
+- the redirect target — `RewriteRule ^ /verify?r=%1 …` (the `%1` is fed by the
+  capture `RewriteCond` above it, which needs no change)
 - the `!^/verify` exclusion guard on **all three** rules (block, challenge, refuse)
 
 The exclusion guard must be the same prefix as the `ProxyPass` target — it exists to

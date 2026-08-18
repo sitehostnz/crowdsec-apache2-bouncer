@@ -114,10 +114,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proof-of-work per `CAPTCHA_PASS_TTL`, it never bypasses a ban, and solving early
   costs an attacker exactly what solving on demand does. The levers are the cost
   dials and the TTL, not the timing. ([#7])
-- `apache/blocklist.conf` ships a commented **rate-limit** option for the challenge
-  endpoint (`mod_evasive` and an `iptables hashlimit` form), with the README
-  explaining why it belongs at Apache: the daemon bounds work per address and
-  memory in total, but nothing in it bounds the request rate. ([#7])
+- The README states plainly that **nothing bounds the challenge endpoint's request
+  rate** — the daemon bounds work per address, mint concurrency and memory in
+  total, but an address-hopping flood still buys one mint per fresh address. A
+  verified rate-limit recipe is tracked in [#9]; an earlier draft shipped
+  `mod_evasive` and `iptables hashlimit` examples, and both were pulled in review
+  as unsafe to copy-paste. ([#7])
 - `apache/blocklist.conf` ships a commented option for **self-hosting the widget
   script**. A `<script type="module">` request sends `Accept: */*`, which does not
   match the `text/html` cond, so a self-hosted asset fell through to the refuse
@@ -131,8 +133,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing captcha under the shipped `BOUNCING_ON_TYPE=ban`, and the daemon refused
   to start at all. That contradicted the rule the rest of the captcha config
   follows: a captcha misconfiguration must never take ban enforcement down. The
-  listener is now switched off with a warning naming the setting to change, and
-  bans keep updating. ([#7])
+  listener is now switched off with a warning naming the settings to change, and
+  bans keep updating. The boundary is deliberate: routing mismatches degrade,
+  while malformed captcha *values* — an unknown `ALTCHA_ALGORITHM`, a work budget
+  no browser can finish, a removed provider setting — are still refused at
+  startup, so a typo surfaces at the terminal rather than on the day the routing
+  is finally enabled. ([#7])
 - **The pass-map collision guard now covers retired maps.** It checked only the
   maps the current policy renders, so under `BOUNCING_ON_TYPE=captcha` the ban map
   was invisible to it: pointing `CAPTCHA_PASS_FILE` at `blocklist.txt` was accepted
@@ -284,3 +290,4 @@ an Apache `RewriteMap`, so banned traffic is turned away by Apache itself.
 [#2]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/2
 [#6]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/6
 [#7]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/pull/7
+[#9]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/9
