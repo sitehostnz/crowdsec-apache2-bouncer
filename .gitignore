@@ -1,2 +1,4 @@
 crowdsec-apache2-bouncer
 .idea
+*.rpm
+*.deb
