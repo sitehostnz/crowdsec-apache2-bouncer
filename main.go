@@ -25,6 +25,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os/signal"
 	"syscall"
@@ -33,10 +34,22 @@ import (
 // -dir overrides BLOCKLIST_DIR; explicit OUTPUT_FILE/DBM_FILE override both.
 var flagDir = flag.String("dir", "", "directory for blocklist.txt/.dbm (default /var/lib/crowdsec-apache2-bouncer, or BLOCKLIST_DIR)")
 
+// -version answers the question you ask standing on the box: which build is this?
+// Until now the only way to tell was to scrape the metrics endpoint, which needs
+// the daemon running and METRICS_LISTEN set - no use when it will not start, which
+// is exactly when the question comes up.
+var flagVersion = flag.Bool("version", false, "print the version and exit")
+
 // main loads the config, builds the bouncer, and runs it until SIGINT/SIGTERM.
 func main() {
 	log.SetFlags(log.LstdFlags) // local date+time on each line (journald adds its own too)
 	flag.Parse()
+	if *flagVersion {
+		// Straight to stdout, not the log, so it can be captured without a
+		// timestamp in front of it.
+		fmt.Println(userAgent)
+		return
+	}
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("FATAL: %v", err)
