@@ -40,10 +40,18 @@ fi
 blocklist_dir=/var/lib/crowdsec-apache2-bouncer
 mkdir -p "$blocklist_dir"
 chmod 0755 "$blocklist_dir"
-if [ ! -e "$blocklist_dir/blocklist.txt" ]; then
-    : > "$blocklist_dir/blocklist.txt"
-    chmod 0644 "$blocklist_dir/blocklist.txt"
-fi
+# captcha_passed.txt is here for the same reason, and it is the one an operator is
+# most likely to declare before the daemon has ever created it: the captcha block in
+# blocklist.conf names it as a txt: RewriteMap, and uncommenting that block is a
+# separate step from starting the daemon. The daemon pre-creates it too (see
+# startChallenge), so this only covers configuring Apache before the service first
+# runs.
+for map in blocklist.txt captcha_passed.txt; do
+    if [ ! -e "$blocklist_dir/$map" ]; then
+        : > "$blocklist_dir/$map"
+        chmod 0644 "$blocklist_dir/$map"
+    fi
+done
 
 # On an upgrade the running daemon is still the old binary, so restart it - but
 # only if it was already enabled, since a fresh install deliberately leaves the
