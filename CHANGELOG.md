@@ -5,53 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-07-31
+## [1.0.0] - 2026-08-24
 
-First public release ([#1]). A CrowdSec bouncer for cPanel and Plesk Apache origins:
-it follows the CrowdSec decision stream and keeps the currently banned addresses in
-an Apache `RewriteMap`, so banned traffic is turned away by Apache itself.
+Adds captcha as a remediation. 0.1.0 sent every accepted decision to one ban map;
+decisions now route per remediation, so a flagged visitor can be challenged instead
+of blocked. Upgrading needs no config change — the captcha is off until you set
+`CAPTCHA_LISTEN`.
 
 ### Added
 
-- Blocks banned addresses at Apache through a `RewriteMap` — the full ban list on
-  startup, then updates every `UPDATE_FREQUENCY` seconds. An empty map is created
-  before the first sync if none exists, since Apache refuses to start when a
-  `RewriteMap` file is missing; an existing list is never overwritten. ([#1])
-- Optional DBM hash map (`MAP_TYPE=dbm`, what the packages ship with) for
-  constant-time lookups on large lists. If a rebuild ever fails the previous map
-  stays in place, so the list is never lost. ([#1])
-- Updates are picked up by Apache on their own — no reload or restart needed — and
-  the map is swapped in atomically, so Apache never reads a half-written file. ([#1])
-- Built for six-figure ban lists: a poll only does work proportional to what
-  changed, and memory use stays flat however long the daemon runs. ([#1])
-- Your own allowlist and blocklist alongside CrowdSec's, created in `CUSTOM_LIST_DIR`
-  beside Apache's own config and, in `dbm` mode, rebuilt whenever you edit one. The
-  allowlist always wins over a ban. ([#1])
-- Range and CIDR bans are expanded to individual addresses, up to
-  `EXPAND_MAX_HOSTS`. Anything larger, including any sizeable IPv6 range, is skipped
-  and logged rather than bloating the map. ([#1])
-- IPv6 bans, written in the canonical form Apache matches against. ([#1])
-- An address covered by more than one CrowdSec decision stays blocked until the last
-  of those decisions expires. ([#1])
-- A periodic full re-sync (`RESYNC_INTERVAL`) as a safety net, which also rebuilds
-  the map if something removes it. A re-sync that would unban most of the list is
-  held back until a second one agrees, so a momentary LAPI fault can't clear your
-  blocklist. ([#1])
-- Separate timeouts for talking to the LAPI: `REQUEST_TIMEOUT` to fail fast when it
-  is unreachable, and `STREAM_REQUEST_TIMEOUT` (15s by default) so a large first
-  download isn't cut short. ([#1])
-- HTTPS to the LAPI, verified against the system CA store, with `CA_BUNDLE` and
-  `INSECURE` overrides. ([#1])
-- Identifies itself to CrowdSec with its release version, so `cscli bouncers list`
-  shows which build each origin is running. ([#1])
-- Configuration through `/etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf`, plus
-  a `-dir` flag to put the map files somewhere else. ([#1])
-- A hardened `systemd` unit and a ready-to-include Apache snippet. ([#1])
-- README covering installation, cPanel and Plesk integration, getting the real
-  client IP behind a CDN, and performance notes. ([#1])
-- `.deb` and `.rpm` packages and a static binary, built and attached to each GitHub
-  release automatically. ([#1])
-- A benchmark suite covering the paths that run on every update. ([#1])
+- `BOUNCING_ON_TYPE`, `OVERRIDE_REMEDIATION` and `FALLBACK_REMEDIATION`, matching the nginx bouncer's names and precedence. ([#2])
+- Each reachable remediation renders its own map, so one address can hold a ban and a captcha at once. ([#2])
+- Captcha challenge listener (`CAPTCHA_LISTEN`, off by default) verifying ALTCHA proof of work in-process — no captcha service, no shared secret. ([#2])
+- Solvers go in a `txt:` pass map Apache reads ahead of the captcha map, so a solve applies on the next request. ([#2])
+- `ALTCHA_ALGORITHM`, `ALTCHA_COST` and `ALTCHA_COMPLEXITY` tune the check; an unusable combination falls back to the defaults with a warning. ([#2])
+- `CAPTCHA_TEMPLATE` replaces the built-in challenge page. ([#2])
+- Prometheus endpoint (`METRICS_LISTEN`, off by default) covering poll health, map sizes and captcha counters. ([#2])
+- Captcha rules in `apache/blocklist.conf`, shipped commented out. ([#7])
+- `-version` prints the build and exits.
 
+> ⚠️ Challenged vhosts need HTTPS. The widget uses `crypto.subtle`, which browsers
+> expose only in a secure context, so a challenged visitor on plain HTTP can never
+> solve. Keep those vhosts on `FALLBACK_REMEDIATION=ban`.
+
+### Changed
+
+- The startup line states the resolved remediation policy and every map it will write.
+- Config faults are tiered: substitute and warn, switch the captcha off, or refuse to start. Only data loss refuses.
+- `postinst` pre-creates `captcha_passed.txt`, so Apache does not refuse to start on a missing `RewriteMap`.
+
+### Deprecated
+
+- `ONLY_BAN`, replaced by `BOUNCING_ON_TYPE`. Setting both is a startup error.
+
+### Security
+
+- The challenge fails closed: a token that does not verify leaves the client challenged. ([#2])
+- The widget script is pinned with a Subresource Integrity digest. ([#2])
+- The client address is the last `X-Forwarded-For` entry; an unparseable one is refused rather than keyed to loopback. ([#7])
+- Apache exemptions are anchored to the proxied path, and the ban rule carries none — a banned client cannot reach the mint endpoint. ([#2])
+- Return targets are reduced to a same-site rooted path. ([#2])
+- Passes are discarded at startup and emptied at shutdown. ([#2])
+- A `CAPTCHA_LISTEN` bind wider than loopback warns at startup. ([#2])
+- The challenge store caps at 200,000 outstanding and refuses rather than evicting; alert on `altcha_challenges_refused_total`. Nothing bounds the request rate yet. ([#9])
+
+## [0.1.0] - 2026-07-31
+
+First public release ([#1]). A CrowdSec bouncer for cPanel and Plesk Apache origins:
+it follows the decision stream and keeps banned addresses in an Apache `RewriteMap`,
+so banned traffic is turned away by Apache itself.
+
+### Added
+
+- Blocks banned addresses through a `RewriteMap`, refreshed every `UPDATE_FREQUENCY`. ([#1])
+- Creates an empty map before the first sync, since Apache refuses to start without one. ([#1])
+- Optional DBM hash map (`MAP_TYPE=dbm`, what the packages ship) for constant-time lookups. ([#1])
+- A failed DBM rebuild leaves the previous map in place, so the list is never lost. ([#1])
+- Maps are swapped in atomically and picked up without an Apache reload. ([#1])
+- A poll does work proportional to what changed, and memory stays flat. ([#1])
+- Your own allowlist and blocklist in `CUSTOM_LIST_DIR`; the allowlist wins over a ban. ([#1])
+- Refuses a resync that would unban most of the list, and re-checks on the next poll. ([#1])
+- Ships a systemd unit, a conffile and `.deb`/`.rpm` packages. ([#1])
+
+[1.0.0]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/releases/tag/v0.1.0
 [#1]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/pull/1
+[#2]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/2
+[#7]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/pull/7
+[#9]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/9
