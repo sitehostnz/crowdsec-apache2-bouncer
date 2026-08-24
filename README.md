@@ -169,7 +169,8 @@ ErrorDocument 403 /crowdsec-blocked.html
 (non-3xx codes return directly, no redirect): `RewriteRule ^ - [R=429,L]` plus
 `ErrorDocument 429 …`. 429 matches the official mod_crowdsec bouncer's default and
 makes blocks trivially distinguishable from application 403s in the existing logs.
-Optionally add `Header always set Retry-After "600" "expr=%{REQUEST_STATUS} == 429"`.
+Optionally add `Header always set Retry-After "600" "expr=%{REQUEST_STATUS} == 429"`
+(this one needs `mod_headers`; nothing else here does).
 
 **Dedicated block log** — tag matches with an env var and log them conditionally:
 
@@ -306,7 +307,502 @@ Crucially, the lookup cost differs:
   always skipped. For large-range bans use the `cs-firewall-bouncer` (ipset
   `hash:net`) instead/alongside; ipset does CIDR natively.
 - **Country/AS/username** scoped decisions are skipped (can't map to IPs without geo).
-- Only `type=ban` by default (`ONLY_BAN`).
+- Only `type=ban` by default (`BOUNCING_ON_TYPE`) — see below.
+- **`throttle`** has no `RewriteMap` expression at all and is never enforced.
+
+## Remediations
+
+Three settings decide what happens to a decision. They carry the **same names,
+values and order as the nginx bouncer**, so a fleet running both needs one mental
+model:
+
+| | Values | Default | |
+|---|---|---|---|
+| `BOUNCING_ON_TYPE` | `ban` / `captcha` / `all` | `ban` | Which decisions are acted on at all |
+| `OVERRIDE_REMEDIATION` | `ban` / `captcha` / empty | empty | Replaces whatever the hub asked for |
+| `FALLBACK_REMEDIATION` | `ban` / `captcha` | `ban` | Catches what cannot be expressed. Has no "off": empty means `ban`, and so does `captcha` with no listener |
+
+They apply in that order, and **override runs before fallback** — which is the
+detail that matters. `OVERRIDE_REMEDIATION=captcha` on a box where no challenge is
+configured degrades to `FALLBACK_REMEDIATION` and *blocks*, rather than quietly
+enforcing nothing.
+
+The fallback catches two cases: a remediation Apache can't express (`throttle` has
+no `RewriteMap` form at all), and a `captcha` when no challenge listener is running.
+It has **no "off"** — blanking the line means `ban`, the same as leaving it out, and
+the daemon says so at startup. Setting it to `captcha` on a box with no listener
+means `ban` too, and says so: the fallback is what catches an unservable captcha, so
+it cannot be one itself without leaving those decisions enforced by nothing. Dropping those decisions was possible once, and it
+was the only way to leave a decision the hub made enforced by nothing at all; the
+matching value in CrowdSec's own nginx bouncer is `ban` too.
+
+Each reachable remediation renders to its **own** map, because the type decides what
+Apache does with a hit:
+
+| Remediation | Map |
+|---|---|
+| `ban` | `blocklist.txt` / `.dbm` — i.e. `OUTPUT_FILE` / `DBM_FILE` |
+| `captcha` | `captcha.txt` / `.dbm`, in the same directory |
+
+The map set is **derived** from the three settings, so a map exists exactly when
+something can land in it — `OVERRIDE_REMEDIATION=captcha` builds no ban map at all.
+The ban map keeps `OUTPUT_FILE`/`DBM_FILE`, so an existing Apache config still points
+at the right file. A single address can hold a ban *and* a captcha at once, and a
+decision the hub escalates from captcha to ban moves between maps rather than sitting
+in both.
+
+The startup line states the resulting policy outright:
+
+```
+remediation policy: bouncing_on=all override="" fallback="ban" -> ban:ban captcha:captcha throttle:ban
+```
+
+To emit captcha decisions at all you also need a
+[captcha profile](https://docs.crowdsec.net/docs/local_api/profiles/captcha_profile/)
+on the LAPI.
+
+> **`ONLY_BAN` is deprecated** and will be removed. It's read only when
+> `BOUNCING_ON_TYPE` is unset (`true` → `ban`, `false` → `all`) and warns at every
+> start. Note `ONLY_BAN=false` is no longer equivalent: it used to force every
+> decision type into the ban map, where captcha decisions now render to their own
+> and `FALLBACK_REMEDIATION` decides what happens without a challenge.
+
+### The challenge listener
+
+Apache can't run a captcha on its own: `mod_rewrite` cannot derive a key, and has
+nowhere to keep the challenge it issued. (`RewriteMap prg:` is not a way round it —
+Apache runs one copy for the whole server behind the `rewrite-map` mutex, so any work
+there blocks every worker.) So the daemon serves the challenge itself, on loopback,
+and Apache proxies to it.
+
+```
+CAPTCHA_LISTEN=127.0.0.1:8125
+CAPTCHA_PATH=/crowdsec-verify
+```
+
+A challenged client is redirected to the listener, solves the widget, and the daemon
+verifies it in-process before writing them into a **pass map** Apache checks ahead of
+the captcha map. The pass map is a `txt:` map on purpose:
+Apache re-reads it the moment its mtime changes, so a solve takes effect on the
+very next request instead of waiting for a DBM rebuild. It's the one map where the
+latency is user-visible.
+
+> ⚠️ **Bind it to loopback.** The last `X-Forwarded-For` entry — the one `mod_proxy`
+> appends — is what a pass is recorded against, so a directly reachable listener
+> would let anyone name their own address and exempt it.
+
+**The widget script.** `CAPTCHA_WIDGET_JS` is a pinned jsDelivr URL and
+`CAPTCHA_WIDGET_SRI` is the digest the browser checks it against — both defaulted, so
+leaving them alone gets you a verified widget for free. The two answer different
+threats: pinning the version stops an unreviewed release arriving on every customer
+page with no deploy here, and the digest stops a compromised CDN edge substituting
+script that would run on the customer's own origin with their cookies.
+
+Point `CAPTCHA_WIDGET_JS` somewhere else and `CAPTCHA_WIDGET_SRI` **must** change
+with it — a digest that doesn't match blocks the script outright, and a blocked
+widget is a page that renders 200 and can never be solved:
+
+```bash
+curl -sL <url> | openssl dgst -sha384 -binary | openssl base64 -A
+```
+
+If you don't have the new digest, remove the setting entirely — *only* an empty
+value drops the attribute and warns at startup. A stale value is used verbatim
+against whatever URL you set.
+
+`CAPTCHA_WIDGET_JS` doesn't have to be absolute. Serving the widget from your own
+origin across a fleet of vhosts is better done root-relative — `/crowdsec-assets/altcha.js` —
+because the challenge page is served *through* `ProxyPass` on the customer's own
+vhost, so the browser resolves the asset against that origin and each host serves
+its own copy. No cross-origin fetch, no one host every customer page depends on,
+and the integrity check becomes same-origin. Two things come with it: the asset
+prefix must be **exempted on both captcha rules** — and only those, never the block
+rule — or a challenged client is refused the very script it needs and the page spins
+forever, and `Alias` (unlike the rewrite rules) is inherited by vhosts, so it's
+declared once. Optional extra 5 in `apache/blocklist.conf` ships both, on that same
+`/crowdsec-assets/` prefix.
+
+A digest the daemon can't parse — most often a hash of the wrong length for the
+algorithm named in front of it, from running `openssl dgst -sha256` while leaving a
+`sha384-` prefix — **switches the challenge listener off**, with a warning naming
+the problem. There's nothing safe to substitute (a digest names the bytes of
+whatever `CAPTCHA_WIDGET_JS` points at), so the challenge simply isn't served and
+captcha decisions take `FALLBACK_REMEDIATION`. It is not fatal: that would take ban
+enforcement down with the captcha. An unusable `CAPTCHA_TEMPLATE` is *not* the same:
+it fails later, once routing is already fixed, so the captcha map is still rendered
+and the log line at that failure names the map left unserved. Whitespace-separated digest lists and `?options` suffixes are
+spec-legal and accepted; every member of a list has to be valid.
+
+The built-in digest paired with a URL that isn't the built-in one only **warns** —
+a digest names bytes, not a URL, so that pairing is exactly right if you're
+mirroring the pinned build onto your own origin.
+
+**Replacing the page.** `CAPTCHA_TEMPLATE` takes a Go `html/template` and is given:
+
+| Field | What it is |
+| --- | --- |
+| `{{.Widget}}` | the `<altcha-widget>` element, built here and already escaped |
+| `{{.WidgetJS}}` | the widget script URL |
+| `{{.WidgetSRI}}` | its digest, empty when none is configured — guard the attribute with `{{if}}` |
+| `{{.Action}}` | where the solved form posts (`CAPTCHA_PATH`) |
+| `{{.Return}}` | the path to send the visitor back to, already reduced to a same-site path |
+| `{{.SolveEvent}}` | the event name the widget fires on success |
+| `{{.Error}}` | a message to show on a failed attempt, empty on the first render |
+
+All but `{{.Error}}` are **required** and checked at startup, because `html/template`
+silently ignores fields a template doesn't reference — a page written against an
+older field set parses cleanly, renders 200 and can't be solved. `{{.SolveEvent}}` is
+in that list because the built-in form has no submit button: the listener it names is
+what submits. The built-in page in `challenge.go` is the reference.
+
+The daemon issues and checks its own proof-of-work — there is no captcha service, no
+Valkey, no proxy to one, and no shared secret on the wire. It publishes half of a derived key and keeps the other half; the browser searches counters until its
+derived key starts with the published prefix, then returns the whole thing. The half
+that was never published is the proof, so verification is a string comparison — and
+because redeeming removes the challenge, a solution cannot be replayed.
+
+| | Default | |
+|---|---|---|
+| `ALTCHA_ALGORITHM` | `PBKDF2/SHA-256` | also `SHA-256/384/512`, `PBKDF2/SHA-384`, `PBKDF2/SHA-512`. An unknown name falls back to the default, with a startup warning |
+| `ALTCHA_COST` | `5000` | iterations per attempt |
+| `ALTCHA_COMPLEXITY` | `5000` | attempts the visitor makes; they expect to try half, and up to all of them at worst. Held to `1000000` |
+
+The two multiply, and a combination a browser cannot finish inside the widget's
+90-second timeout makes the daemon fall back to **all three defaults** with a
+startup warning — never a refusal to start, since that would take ban enforcement
+down over a captcha dial. It prints the estimate at startup either way. Prefer
+raising complexity: it costs the visitor alone, where cost is also paid once per
+challenge the daemon mints. Together the defaults are ~12.5M iterations, a second or
+two in a browser — half what the nginx bouncer asks for, which uses the same cost
+with `ALTCHA_COMPLEXITY=10000`.
+
+`ALTCHA_COMPLEXITY` is separately held to `1000000`, and that ceiling is doing a
+different job from the fallback above. The estimate in the startup line is an
+*average*: the counter the daemon picks is uniform over the range, so an unlucky
+visitor scans close to all of it and pays roughly twice what the line says. The
+budget checks are sized on the average, so the ceiling is what keeps that tail
+inside the 90-second timeout. Past it the value is held rather than reset — a
+deliberate algorithm and cost survive a complexity the daemon is willing to
+substitute for.
+
+> ⚠️ **Requires HTTPS.** The widget uses `crypto.subtle`, which browsers
+> expose only in a secure context, so on a plain-HTTP vhost it errors and no solve
+> can ever arrive — the visitor is challenged forever. There is no fallback provider, so if any vhost is HTTP-only, either serve it over TLS or keep those
+> decisions on `ban` with `FALLBACK_REMEDIATION=ban`.
+
+**What it costs the daemon.** Benchmarked with the challenge-listener suite in
+`profile_test.go` (`go test -run '^$' -bench . -benchmem`), on a Ryzen 5 7535U at
+the shipped defaults — treat the numbers as shape rather than gospel:
+
+| Operation | When it happens | Cost |
+| --- | --- | --- |
+| Mint a challenge (`PBKDF2/SHA-256`, cost 5000) | once per challenged address per 20 min | ~0.7 ms, ~1 KB allocated |
+| Re-issue the outstanding challenge | every re-fetch by the same address | ~1 µs |
+| Render the challenge page | every challenged `GET` | ~7 µs |
+| Verify a solve | per solve `POST` | ~1.4 µs |
+| Record a pass | per successful solve | ~27 µs holding 1 pass, ~250 µs holding 10,000 — the whole map is rewritten |
+| Challenge store at its 200k cap | worst-case flood | ~195 B per challenge, ~37 MiB total |
+
+The shape to remember: **minting is the only expensive step, and deliberately so** —
+it is one pass of the same KDF the visitor's browser must run thousands of times,
+so it *is* the proof-of-work dial rather than overhead. Everything around it costs
+microseconds. Three things keep a flood from weaponising it: a challenged address
+gets the same challenge back until it solves or expires, so reloads never re-mint;
+concurrent mints are capped at half the CPUs, so the poll loop maintaining the ban
+maps always has a core; and the store refuses new challenges at 200k outstanding, so
+the most an address-hopping flood can pin is ~37 MiB — the refusal is logged, and
+`altcha_challenges_refused_total` on `/metrics` counts every client turned away.
+
+Alert on that counter rather than on `altcha_challenges_minted_total`. The mint rate
+climbs with a flood but **stops** once the store is full, because every new address
+is refused before it derives — and `altcha_challenges` then pins at 200k, which reads
+like a healthy maximum. So the mint rate goes flat at exactly the moment the flood
+achieves what it was for; the refusal counter is the one that keeps rising.
+
+**There is no request-rate limit yet.** Everything above bounds the work per
+*address* and the memory in total; **nothing bounds the request rate**, so an
+address-hopping flood still drives one mint per fresh address. A *banned* address is
+not part of that: the block rule carries no `/crowdsec-verify` exemption, so it is
+refused before it reaches the proxy at all. What remains is every address that isn't
+banned — the endpoint never consults the decision set, so any of them can mint — and
+that is the gap worth sizing a limit against.
+
+That last bound belongs at a layer that can see the connection, and a verified
+recipe is tracked in
+[#9](https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/9). An earlier
+draft shipped `mod_evasive` and `iptables hashlimit` examples; both turned out to be
+unsafe to copy-paste and were pulled — the details are on the issue. If you add your
+own before then, the shape to aim for is a **per-path request limit on
+`/crowdsec-verify`** — `mod_qos`'s `QS_LocRequestLimitMatch`, a `mod_security` rule,
+or fail2ban driven off the daemon's own log are the candidates; `mod_ratelimit` is
+the wrong tool (it shapes bandwidth, not requests). Keep it loose enough that a real
+visitor can still load the page and fetch one challenge — a solve is one page `GET`,
+one challenge `GET` and one `POST` — because too tight turns the captcha into a
+block.
+
+To see whether any of this is needed, watch `altcha_challenges_minted_total` and
+`altcha_challenges_refused_total` together — the first is the work an abuser is
+asking for, the second is what a full store is doing to legitimate clients. Either
+means switching the metrics listener on: it is **off** unless `METRICS_LISTEN` is
+set (e.g. `METRICS_LISTEN=127.0.0.1:9876`, on loopback — never proxy it from a
+customer vhost). `client_ip_failures_total` on the same endpoint is worth an eye
+too: it stays at zero behind a correct `ProxyPass`.
+
+**What a pass is keyed on.** The solver's address, matching CrowdSec's own nginx
+bouncer, so the Apache side is a plain map lookup identical to the ban list. One
+solver therefore lets through every browser at that address — everyone behind the
+same NAT included.
+
+Cookie keying would be the more correct answer under NAT, and was removed: the
+daemon minted the token but nothing else was finished, so setting it produced a
+daemon that recorded cookies while Apache matched addresses, re-challenging every
+visitor forever. Better absent than half-present.
+
+**A pass can be obtained before you are challenged, and that is intended.** The
+challenge endpoint has to be reachable by everyone — a challenged client could not
+otherwise get to it — and, separately, it does not check whether the caller is
+currently under a captcha decision. So anyone can solve at any time and hold a pass
+for `CAPTCHA_PASS_TTL`, including before CrowdSec has flagged them at all.
+
+Those two are independent, and the second is a choice rather than a consequence: an
+endpoint can be reachable by everyone and still refuse to mint for a caller holding
+no decision, and the daemon does have the decision set in memory to check against.
+It is left open because the toll is the same either way (below), and because gating
+it would refuse the challenge to anyone flagged in the window before the next poll
+carries that decision into the map — a legitimate visitor stuck on a page that will
+not let them through. If that trade ever stops being worth it, the gate is a small
+change, not a redesign.
+
+Read plainly: **a captcha here is a per-address toll of one proof-of-work per TTL,
+not a gate that fires the moment you are flagged.** Solving in advance costs an
+attacker exactly what solving on demand does — one proof per address per hour at the
+default — so it buys no discount, only the choice of when to pay. It grants nothing
+else: a pass never bypasses a **ban** (the block rule ignores the pass map
+entirely), and it only ever exempts the address that solved.
+
+The lever that matters is therefore the toll itself, not the timing — `ALTCHA_COST`
+and `ALTCHA_COMPLEXITY` for how much each solve costs, and `CAPTCHA_PASS_TTL` for
+how long it buys. Shorten the TTL if you want the toll paid more often. (CrowdSec's
+nginx bouncer serves its captcha inline as the remediation, so there the endpoint
+cannot be pre-solved; the trade here is a standalone endpoint that any vhost can
+proxy to without embedding the challenge in every one.)
+
+**Failure behaviour is fail-closed throughout.** A token that is missing, malformed,
+wrong, expired or already spent leaves the client challenged — a fault in the check
+must never become a free pass for the traffic the hub flagged. A
+pass that can't be written to disk is likewise reported as a failure rather than a
+redirect, so the client isn't bounced into a loop. And passes are discarded when
+the daemon restarts: they live in memory, so a file inherited from a previous run
+would name clients with no expiry and stay valid forever.
+
+### Apache configuration
+
+The package ships these rules in `apache/blocklist.conf`, which is the copy to
+edit — it carries the full commentary and is what the walkthrough above installs.
+
+> ⚠️ **The captcha rules ship commented out.** Only the plain ban rule is active in
+> the file as installed. Enabling captcha is two halves and *both* are required: set
+> `BOUNCING_ON_TYPE=all` (or `captcha`) and `CAPTCHA_LISTEN` on the daemon, **and**
+> uncomment the captcha block in `apache/blocklist.conf`, replacing the single block
+> rule above it. Do only the daemon half and everything looks healthy — `captcha.txt`
+> fills up correctly and the daemon logs normally — while Apache never consults the
+> map and not one visitor is ever challenged. Nothing warns you, because from the
+> daemon's side nothing is wrong.
+
+Reproduced here so the shape is visible without a checkout:
+
+```apache
+RewriteMap crowdsec dbm:/var/lib/crowdsec-apache2-bouncer/blocklist.dbm
+RewriteMap captcha  dbm:/var/lib/crowdsec-apache2-bouncer/captcha.dbm
+RewriteMap solved   txt:/var/lib/crowdsec-apache2-bouncer/captcha_passed.txt
+
+# A ban outranks a captcha, so the block rule stays FIRST - and carries NO
+# exemption: a banned client has no business reaching the challenge listener.
+RewriteCond %{ENV:REDIRECT_STATUS} ^$
+RewriteCond ${crowdsec:%{REMOTE_ADDR}|0} =1
+RewriteRule ^ - [F]
+
+# Challenge HTML navigations, while the daemon is up to answer them.
+RewriteCond %{ENV:REDIRECT_STATUS} ^$
+RewriteCond %{REQUEST_URI} !^/crowdsec-verify(/|$)
+RewriteCond ${solved:%{REMOTE_ADDR}|0}  !=1
+RewriteCond ${captcha:%{REMOTE_ADDR}|0}  =1
+RewriteCond %{HTTP_ACCEPT} text/html
+RewriteCond /run/crowdsec-apache2-bouncer/challenge.up -f
+# LAST cond: %1 below comes from it. Always matches; it captures, it doesn't filter.
+RewriteCond %{REQUEST_URI}?%{QUERY_STRING} ^(.*)$
+RewriteRule ^ /crowdsec-verify?r=%1 [B,R=302,L,NE]
+
+# Anything else from a challenged client - and everything, once the daemon is
+# down - is refused rather than redirected.
+RewriteCond %{ENV:REDIRECT_STATUS} ^$
+RewriteCond %{REQUEST_URI} !^/crowdsec-verify(/|$)
+RewriteCond ${solved:%{REMOTE_ADDR}|0}  !=1
+RewriteCond ${captcha:%{REMOTE_ADDR}|0}  =1
+RewriteRule ^ - [F]
+
+# Only two paths under the prefix are ever real: the page, and the widget's JSON
+# fetch. ProxyPass strips its own prefix, so without this a request for
+# /crowdsec-verify/<anything>/altcha-challenge reaches the daemon as
+# /<anything>/altcha-challenge.
+#
+# No REDIRECT_STATUS guard here, unlike the three rules above: [R=404] sets a
+# status rather than issuing a redirect, and an ErrorDocument target cannot sit
+# under the proxied prefix, so this rule cannot re-enter on an internal one.
+RewriteCond %{REQUEST_URI} ^/crowdsec-verify/
+RewriteCond %{REQUEST_URI} !^/crowdsec-verify/altcha-challenge$
+RewriteRule ^ - [R=404,L]
+
+# A WAF can refuse the challenge itself when the visitor's own path lands in r=,
+# which soft-locks them. Safe to exempt: the daemon already treats r= as hostile.
+# The IfModule guard is required - without mod_security present, SecRuleEngine is
+# an "Invalid command" and Apache refuses to start.
+#
+# LocationMatch, not Location: <Location /crowdsec-verify> is a plain string
+# prefix with no segment boundary, so it would switch the WAF off for
+# /crowdsec-verifyXYZ and /crowdsec-verify.php too - which ProxyPass does not
+# answer, so any client at all could reach the customer's application with the
+# rule engine disabled.
+<IfModule security2_module>
+    <LocationMatch "^/crowdsec-verify(/|$)">
+        SecRuleEngine Off
+    </LocationMatch>
+</IfModule>
+
+# No trailing slash on either side. With one on the target, a subpath such as
+# /crowdsec-verify/altcha-challenge maps to //altcha-challenge, which lands
+# outside the proxy prefix and is then refused by the rules above - the widget
+# never receives a challenge and the page hangs with nothing logged.
+ProxyPass        /crowdsec-verify http://127.0.0.1:8125
+ProxyPassReverse /crowdsec-verify http://127.0.0.1:8125
+```
+
+Those two proxy lines are the whole of it. The daemon takes the client address off
+the `X-Forwarded-For` that `mod_proxy` appends itself, reading only the **last**
+entry — the one Apache wrote. Anything the client put in that header sits in front of
+it and is ignored. There is no header to set.
+
+> ⚠️ **`ProxyAddHeaders` must stay `On`** (its default), and nothing may strip
+> `X-Forwarded-For` on this location. With either changed, Apache appends nothing but
+> still forwards what the client sent, so the daemon reads a header the *client*
+> wrote — and anyone can record a pass against an address they don't control. The
+> daemon can't detect it: through the proxy the peer is loopback either way.
+
+Five things there are not obvious, and each is a failure that has been hit rather
+than a precaution:
+
+1. **`%{ENV:REDIRECT_STATUS} ^$` — act only on the original request.**
+   `ErrorDocument` performs an internal redirect, which re-runs these rules against
+   the error page's own URI. Without the guard, a challenged client hitting any
+   error page is challenged again, which errors again: an infinite redirect loop,
+   not a block.
+2. **The readiness file** — only send someone to the challenge while the daemon is
+   listening. Otherwise the redirect lands on a proxy with nothing behind it, Apache
+   answers 503, `ErrorDocument` turns that into an internal redirect, and (1)
+   becomes a loop. When it is down we refuse instead, which is what
+   `FALLBACK_REMEDIATION=ban` means at the Apache layer.
+3. **Every directive that names the challenge prefix is anchored at a path-segment
+   boundary, and must never match more than `ProxyPass` claims.** A bare
+   `!^/crowdsec-verify` also exempts `/crowdsec-verifyXYZ` and
+   `/crowdsec-verify.php`, which `ProxyPass` does *not* answer — so they skip the
+   rules **and** miss the proxy, landing on the customer's application. Measured,
+   not theorised. Each form gets that boundary a different way, which is the part
+   worth knowing before adding one: a `RewriteCond` spells out `(/|$)`,
+   `<LocationMatch>` takes the same regex, `ProxyPass` is already segment-aware —
+   and plain `<Location>` has no boundary of its own at all, which is exactly why
+   the WAF exemption below is a `<LocationMatch>`.
+4. **Nothing uses `[L]` to let a request *through*.** With `InheritBefore` these
+   rules are prepended to the vhost's own, so an `[L]` here would also stop the
+   customer's rewrites — breaking WordPress permalinks and the like, for exactly the
+   visitors who have just solved a challenge. Each rule that *stops* a request
+   therefore carries its full set of guards, and `!^/crowdsec-verify(/|$)` on the two
+   captcha rules is what keeps the challenge itself from being challenged. It exempts
+   exactly what `ProxyPass` forwards to the listener and no more — a broader
+   `!^/crowdsec-`, or dropping the `(/|$)`, would exempt `/crowdsec-verifyXYZ` and
+   `/crowdsec-verify.php` as well, which `ProxyPass` does not answer, so a challenged
+   client would skip the captcha rules *and* miss the proxy and land on the
+   customer's application. The block rule carries no exemption at all, so there is
+   nothing on it to widen.
+5. **`[B,NE]` on the challenge redirect, and the capture cond above it.** The
+   return target rides inside `r=`, so every character that means something in a
+   query string has to be encoded — otherwise the customer's own query breaks out
+   of the parameter and `/search?q=a&b=c` arrives as `r=/search?q=a` plus a stray
+   `b=c`. The last `RewriteCond` captures `path?query` into `%1`, `[B]` escapes
+   that backreference (`&`, `=`, `+`, `?` all become `%XX`), and `[NE]` stops
+   Apache re-encoding the `%` signs into `%25`. Don't reach for `${escape:…}`
+   here — it's an escaper for URI *paths* and leaves `&`, `=` and `+` alone, which
+   is the bug this replaces. Verified on Apache 2.4.62 (AlmaLinux) and 2.4.68
+   (Debian). With no query string the target ends in a bare `?`, which the daemon
+   trims.
+
+Add the allowlist guard (`RewriteCond ${local_allow:%{REMOTE_ADDR}|0} !=1`) to the
+block, challenge **and refuse** rules if you use the local lists — the same rule as
+everywhere else here: every rule that stops a request needs the guard, and three of
+them do. The refuse rule is the easiest to miss and the worst to miss: guard the
+challenge rule without it and an allow-listed address holding a captcha decision is
+never sent to solve, so it never earns a pass, and the unguarded refuse rule then
+403s every request it makes — page loads included. Optional extra 4 in
+`apache/blocklist.conf` ships the guarded replacement for the block rule.
+
+These directives are subject to the same per-vhost inheritance as the rest, so they
+need `RewriteEngine On` + `RewriteOptions InheritBefore` in each vhost. `mod_proxy`
+must be loaded.
+
+### Renaming the challenge path
+
+`/crowdsec-verify` is only a default — rename it per provider if you'd rather not
+name CrowdSec in a URL a visitor sees. It's one setting on the daemon, but the
+Apache rules name the path literally, so **both sides have to agree**, and a
+mismatch fails silently: the daemon and Apache each look fine on their own.
+
+On the daemon, set the one env var (keep the leading `/`; nothing ties the value to
+the `crowdsec` name):
+
+```bash
+CAPTCHA_PATH=/verify
+```
+
+Everything the daemon serves follows it — the form's action and the widget's
+challenge fetch at `<CAPTCHA_PATH>/altcha-challenge`. Then change the **same path**
+in every Apache rule that names it, all in the block above:
+
+- the `ProxyPass` and `ProxyPassReverse` targets
+- the redirect target — `RewriteRule ^ /verify?r=%1 …` (the `%1` is fed by the
+  capture `RewriteCond` above it, which needs no change)
+- the `!^/verify(/|$)` exclusion guard on the **two captcha** rules (challenge and
+  refuse). Keep the `(/|$)`: a bare `!^/verify` also exempts `/verifyXYZ` and
+  `/verify.php`, which `ProxyPass` does not answer, so they skip the rules *and*
+  miss the proxy and land on the customer's application
+- the **path whitelist** under the prefix — both conds, which are easy to miss
+  because only one of them names the path in a form a grep for the old name finds:
+
+  ```apache
+  RewriteCond %{REQUEST_URI} ^/verify/
+  RewriteCond %{REQUEST_URI} !^/verify/altcha-challenge$
+  RewriteRule ^ - [R=404,L]
+  ```
+
+- and, if you self-host the widget (optional extra 5), the guard that hides the
+  prefix inside an alternation: `!^/crowdsec-(verify(/|$)|assets/)`
+
+The **ban rule deliberately carries no exemption** — do not add one while renaming.
+A banned client has no business reaching the challenge listener, and minting is the
+one thing an unauthenticated caller can make the daemon spend real CPU on.
+
+The exclusion guard must be the same prefix as the `ProxyPass` target — it exists to
+exempt exactly what's proxied and nothing more. Out of step, you get the failures
+this project keeps warning about: a wrong guard loops the redirect, and a wrong
+`ProxyPass` leaves the challenge 404ing with the page hung on "Verifying your
+connection".
+
+Two other spots carry a name, if a *completely* CrowdSec-free surface is the goal:
+
+- **The friendly blocked page** (optional extra above) is `/crowdsec-blocked.html`,
+  which shows in the visitor's address bar. Rename its URL-path in the `Alias`, the
+  `ErrorDocument` and its own `!^…` guard together.
+- The widget fetch `<CAPTCHA_PATH>/altcha-challenge` and the solved-token field
+  (default `altcha`) name the widget, not CrowdSec. The field is `CAPTCHA_TOKEN_FIELD`
+  if you want to change it; the `/altcha-challenge` suffix is fixed.
 
 ## Verify / operate
 

@@ -12,14 +12,28 @@ import (
 	"time"
 )
 
-// write renders the txt map and, when MAP_TYPE=dbm, rebuilds the DBM. A DBM
-// failure is logged but never fatal - the previous DBM is kept.
+// write renders every remediation's map. A write failure stops there and is
+// returned, so the caller keeps the maps it already had rather than a set that
+// is half old and half new.
 func (b *bouncer) write() error {
-	if err := b.writeTxt(); err != nil {
+	for _, r := range b.remediations {
+		if err := b.writeMap(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeMap renders one remediation's txt map and, when MAP_TYPE=dbm, rebuilds its
+// DBM. A DBM failure is logged but never fatal - the previous DBM is kept.
+func (b *bouncer) writeMap(r *remediation) error {
+	if err := b.writeTxt(r); err != nil {
+		b.metrics.mapWriteFail.Add(1)
 		return err
 	}
+	b.metrics.mapWrites.Add(1)
 	if b.cfg.mapType == "dbm" {
-		b.buildDBM() // keeps the previous DBM on failure; logs, never fatal
+		b.buildDBM(r) // keeps the previous DBM on failure; logs, never fatal
 	}
 	return nil
 }
@@ -27,15 +41,17 @@ func (b *bouncer) write() error {
 // writeTxt writes the sorted "<ip> 1" map to a temp file and atomically renames
 // it into place, so Apache never reads a half-written map and the mtime bump
 // triggers a RewriteMap reload.
-func (b *bouncer) writeTxt() error {
-	dir := filepath.Dir(b.cfg.outputFile)
+func (b *bouncer) writeTxt(r *remediation) error {
+	dir := filepath.Dir(r.txt)
 	// 0755: Apache's worker user (daemon/apache) must traverse this directory
 	// to read the map.
 	// #nosec G301
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".blocklist.*.tmp")
+	// Temp name derived from the map's own basename, so two maps in one directory
+	// can never collide and the glob that cleans up after a crash stays per-map.
+	tmp, err := os.CreateTemp(dir, "."+strings.TrimSuffix(filepath.Base(r.txt), ".txt")+".*.tmp")
 	if err != nil {
 		return err
 	}
@@ -48,8 +64,8 @@ func (b *bouncer) writeTxt() error {
 	// collect or sort here - only the render. One buffer beats streaming through
 	// a bufio.Writer: measured, the extra write syscalls cost more than the
 	// allocation saves.
-	w := make([]byte, 0, len(b.sortedIPs)*20)
-	for _, ip := range b.sortedIPs {
+	w := make([]byte, 0, len(r.sortedIPs)*20)
+	for _, ip := range r.sortedIPs {
 		w = append(w, ip...)
 		w = append(w, " 1\n"...)
 	}
@@ -64,15 +80,18 @@ func (b *bouncer) writeTxt() error {
 	}
 	// No fsync by design: after a crash the list is rebuilt from the LAPI on the
 	// next startup, so durability of this file isn't required.
-	return os.Rename(tmp.Name(), b.cfg.outputFile) // atomic; mtime change -> RewriteMap reload
+	return os.Rename(tmp.Name(), r.txt) // atomic; mtime change -> RewriteMap reload
 }
 
-// buildDBM rebuilds the CrowdSec map's DBM. A failure is logged but never fatal.
-// The error says what state the map is in, so it is logged as-is.
-func (b *bouncer) buildDBM() {
-	if err := b.buildDBMFrom(b.cfg.outputFile, b.cfg.dbmFile); err != nil {
-		log.Printf("%v", err)
+// buildDBM rebuilds one remediation map's DBM. A failure is logged but never
+// fatal. The error says what state the map is in, so it is logged as-is.
+func (b *bouncer) buildDBM(r *remediation) {
+	if err := b.buildDBMFrom(r.txt, r.dbm); err != nil {
+		b.metrics.dbmFailures.Add(1)
+		log.Printf("%s: %v", r.name, err)
+		return
 	}
+	b.metrics.dbmRebuilds.Add(1)
 }
 
 // buildDBMFrom converts the txt map at src into a DBM at dst (O(1) lookups) via
@@ -137,23 +156,56 @@ func (b *bouncer) buildDBMFrom(src, dst string) error {
 //
 // An existing map is left completely alone. Overwriting it would turn a restart
 // during a LAPI outage into a mass unban, which is the failure this is guarding.
+// Each map is judged on its own, so adding a remediation to an existing install
+// creates only the new map and leaves the established one untouched.
 func (b *bouncer) ensureMap() {
-	if _, err := os.Stat(b.cfg.outputFile); err == nil {
-		return
+	for _, r := range b.remediations {
+		if _, err := os.Stat(r.txt); err == nil {
+			continue
+		}
+		// The set is empty at this point, so this renders an empty map - enough for
+		// Apache to parse its config; the first sync fills it in.
+		if err := b.writeMap(r); err != nil {
+			log.Printf("creating an empty map at %s: %v", r.txt, err)
+			continue
+		}
+		log.Printf("created an empty map at %s so Apache can parse its config before the first sync", r.txt)
 	}
-	// The set is empty at this point, so this renders an empty map - enough for
-	// Apache to parse its config; the first sync fills it in.
-	if err := b.write(); err != nil {
-		log.Printf("creating an empty map at %s: %v", b.cfg.outputFile, err)
-		return
+}
+
+// dbmSuffixes are the names a DBM can actually carry on disk. httxt2dbm produces
+// whichever its APR backend uses - a single file for Berkeley DB and GDBM, the
+// ".pag"/".dir" pair for SDBM - and buildDBMFrom renames each produced file to
+// base+suffix.
+//
+// The empty suffix is one of the four, not a placeholder: the single-file case
+// renames to the base itself, which is why dbmPresent has always checked it.
+// Removing it would make every single-file backend look like a missing DBM, on
+// every poll. Comparing a path against the bare base is the opposite error and the
+// one the collision guards were fixed for - it catches only that single-file case
+// and misses the other three.
+var dbmSuffixes = []string{"", ".db", ".pag", ".dir"}
+
+// dbmFilesFor returns every name a DBM built at base can occupy.
+func dbmFilesFor(dbm string) []string {
+	out := make([]string, 0, len(dbmSuffixes))
+	for _, suffix := range dbmSuffixes {
+		out = append(out, dbm+suffix)
 	}
-	log.Printf("created an empty map at %s so Apache can parse its config before the first sync", b.cfg.outputFile)
+	return out
+}
+
+// mapFilesFor returns every file the daemon can write for one map: the rendered
+// txt, and the DBM under each name a backend might give it. Anything comparing an
+// operator-supplied path against "the map" wants this rather than the bare base.
+func mapFilesFor(txt, dbm string) []string {
+	return append([]string{txt}, dbmFilesFor(dbm)...)
 }
 
 // dbmPresent reports whether a DBM built at base exists on disk, checking the
 // single-file and two-file backend names.
 func dbmPresent(base string) bool {
-	for _, suffix := range []string{"", ".db", ".pag", ".dir"} {
+	for _, suffix := range dbmSuffixes {
 		if _, err := os.Stat(base + suffix); err == nil {
 			return true
 		}
@@ -161,10 +213,53 @@ func dbmPresent(base string) bool {
 	return false
 }
 
-// dbmReady reports whether the DBM map Apache reads actually exists on disk. In
-// txt mode there is no DBM, so it is trivially ready. run() uses this on startup
-// so it never logs "startup ok" when buildDBM failed and the map Apache consumes
-// is missing.
-func (b *bouncer) dbmReady() bool {
-	return b.cfg.mapType != "dbm" || dbmPresent(b.cfg.dbmFile)
+// retireUnusedMaps empties the maps this policy no longer produces.
+//
+// Changing BOUNCING_ON_TYPE or OVERRIDE_REMEDIATION can stop a remediation being
+// rendered at all. The file it used to write is then frozen at whatever it held
+// when the policy changed - while the operator's Apache config still names it and
+// still consults it on every request. Switching bans over to captchas that way
+// leaves the old ban map enforcing a decision set from before the change,
+// permanently, and because the ban rule is checked first those addresses never
+// even reach the captcha rule. Nothing in the logs would say so.
+//
+// The file is emptied rather than removed: Apache refuses to start when a
+// RewriteMap path is missing, so deleting it would take the web server down at
+// the next reload or restart.
+func (b *bouncer) retireUnusedMaps() {
+	for _, name := range knownRemediations {
+		if b.byType[name] != nil {
+			continue // still produced
+		}
+		txt, dbm := b.cfg.mapPaths(name)
+		info, err := os.Stat(txt)
+		if err != nil || info.Size() == 0 {
+			// Never written here, or already empty - leave the mtime alone rather
+			// than making Apache re-read an unchanged file on every restart.
+			continue
+		}
+		if err := b.writeMap(newRemediation(name, txt, dbm)); err != nil {
+			log.Printf("WARNING: %s is no longer enforced but its map at %s could not be emptied (%v); "+
+				"Apache is still applying its old contents", name, txt, err)
+			continue
+		}
+		log.Printf("%s is not produced under this policy: emptied %s so Apache stops applying the decisions it still held",
+			name, txt)
+	}
+}
+
+// missingDBM returns the path of the first DBM Apache would look for and not
+// find, or "" when every map is in place. In txt mode there is no DBM, so it is
+// trivially "". run() uses this on startup so it never logs "startup ok" when
+// buildDBM failed and a map Apache consumes is missing - and names which one.
+func (b *bouncer) missingDBM() string {
+	if b.cfg.mapType != "dbm" {
+		return ""
+	}
+	for _, r := range b.remediations {
+		if !dbmPresent(r.dbm) {
+			return r.dbm
+		}
+	}
+	return ""
 }

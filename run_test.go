@@ -333,3 +333,58 @@ func TestEnsureMapCreatesOnlyWhenAbsent(t *testing.T) {
 		}
 	})
 }
+
+// The pass map grants exemptions Apache honours off disk whether or not the daemon
+// is running, so run defers stopChallenge to publish an empty map on the way out.
+// That defer is one line, it is the only thing wiring the cleanup to shutdown, and
+// deleting it leaves every other test green - so this test exists to make it fail.
+//
+// The trick is picking a discriminator that only the DEFERRED reset can satisfy.
+// startChallenge also resets the map, at startup, so asserting "empty at the end"
+// proves nothing on its own. Writing a pass line from the test goroutine AFTER the
+// daemon is up means the startup reset has already happened: whatever clears that
+// line has to be the shutdown one. prunePasses cannot do it either - with nothing
+// lapsed and the file present it returns without rewriting.
+//
+// Nothing here touches b.passes, so there is no race with run's own assignment of
+// it. The file is the whole interface.
+func TestRunClearsThePassMapOnShutdown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"new":[],"deleted":[]}`)
+	}))
+	defer srv.Close()
+
+	b := testBouncer(t, func(c *config) {
+		c.lapiURL = srv.URL
+		c.updateFrequency = 20 * time.Millisecond
+		c.resyncInterval = 0
+	})
+	pass := b.cfg.captchaPassFile
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { b.run(ctx); close(done) }()
+
+	// startChallenge has created and reset the map by the time it exists on disk.
+	waitFor(t, "the pass map to be created", func() bool {
+		_, err := os.Stat(pass)
+		return err == nil
+	})
+
+	// A pass the startup reset cannot have written, because it did not exist yet.
+	if err := os.WriteFile(pass, []byte("203.0.113.9 1\n"), 0o644); err != nil {
+		t.Fatalf("seeding a pass: %v", err)
+	}
+
+	cancel()
+	<-done
+
+	got, err := os.ReadFile(pass)
+	if err != nil {
+		t.Fatalf("the pass map must survive shutdown as an empty file, not be removed: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("the pass map still exempts %q after shutdown, so nothing cleared it on the way out: %q",
+			"203.0.113.9", got)
+	}
+}

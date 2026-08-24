@@ -20,8 +20,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # -race, because the daemon polls the LAPI, serves challenges and answers
+      # scrapes on three goroutines over shared state. A data race between the
+      # metrics scrape and the poll loop shipped through three review rounds
+      # precisely because the suite was green without it.
       - name: Test
-        run: go test -count=1 ./...
+        run: go test -race -count=1 ./...
 
       # Build with the same flags as the release, discarding the binary - a
       # compile check that the static release build still succeeds.
