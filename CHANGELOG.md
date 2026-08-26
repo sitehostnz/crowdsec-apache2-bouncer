@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-08-27
+
+### Fixed
+
+- The full-snapshot shrink guard counts IPs rather than decisions, so a resync is no longer refused when CrowdSec re-issues the same addresses under fresh decision ids. ([#13])
+- A snapshot expressing the same addresses as fewer, larger range decisions is no longer read as a mass unban. ([#13])
+
+### Changed
+
+- The shrink guard runs after a snapshot is applied and rolls it back when refused, since only the applied result gives a true IP count. ([#13])
+- The refused-resync warning reports the IPs the snapshot would have removed and added rather than its decision count. ([#13])
+
 ## [1.0.0] - 2026-08-24
 
 Adds captcha as a remediation. 0.1.0 sent every accepted decision to one ban map;
@@ -67,9 +79,11 @@ so banned traffic is turned away by Apache itself.
 - Refuses a resync that would unban most of the list, and re-checks on the next poll. ([#1])
 - Ships a systemd unit, a conffile and `.deb`/`.rpm` packages. ([#1])
 
+[1.0.1]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/releases/tag/v0.1.0
 [#1]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/pull/1
 [#2]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/2
 [#7]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/pull/7
 [#9]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/issues/9
+[#13]: https://github.com/sitehostnz/crowdsec-apache2-bouncer/pull/13

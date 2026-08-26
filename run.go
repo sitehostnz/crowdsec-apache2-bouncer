@@ -74,14 +74,35 @@ func (b *bouncer) run(ctx context.Context) {
 	// scrape during startup.
 	go b.serveMetrics(ctx)
 
-	// initial full sync - retry forever; never write an empty file on failure
+	// initial full sync - retry forever; never write an empty file on a fetch failure.
+	//
+	// An empty snapshot from a SUCCESSFUL fetch is not covered. heldIPs is 0 on the
+	// first pass, so the floor in acceptSnapshot short-circuits and the snapshot is
+	// taken at face value, while the map on disk may hold a full list that write()
+	// then truncates - the mass unban ensureMap's comment describes, via the one path
+	// ensureMap cannot cover (it runs before this loop and skips existing maps).
+	//
+	// So the refusal branch below covers the second and later passes only. Closing the
+	// first-pass gap means giving heldIPs a source on disk; nothing reads r.txt back
+	// today. Known gap.
 	backoff := time.Second
 	for {
 		sr, err := b.fetch(ctx, true)
 		if err == nil {
-			b.applyFull(sr.New)
-			if werr := b.write(); werr != nil {
+			added, removed, accepted := b.applyFull(sr.New)
+			// Write either way: applyFull has already rolled a refused snapshot back, so
+			// this still lands the retained list and self-heals a deleted map.
+			werr := b.write()
+			if werr != nil {
 				log.Printf("startup write failed: %v; retry in %s", werr, backoff)
+			} else if !accepted {
+				// Before the DBM check, so a broken httxt2dbm cannot mask a refusal. No
+				// break: falling through fetches the confirming snapshot, where breaking
+				// would stamp lastFull and push it a whole RESYNC_INTERVAL out. It cannot
+				// spin - the second consecutive refusal takes pendingShrink to 2.
+				b.metrics.resyncRefused.Add(1)
+				log.Printf("WARNING: startup snapshot would have removed %d IPs and added %d, against %s held - refusing to unban that much on a single snapshot; keeping the current list and re-checking in %s",
+					removed, added, b.totals(), backoff)
 			} else if missing := b.missingDBM(); missing != "" {
 				log.Printf("startup: DBM %s not built (httxt2dbm failed?); retry in %s", missing, backoff)
 			} else {
@@ -131,14 +152,14 @@ func (b *bouncer) run(ctx context.Context) {
 		b.metrics.lastPollUnix.Store(time.Now().Unix())
 		switch {
 		case resync:
-			if !b.acceptSnapshot(len(sr.New)) {
-				// lastFull is deliberately NOT advanced, so the next tick asks for
-				// another snapshot rather than waiting a whole RESYNC_INTERVAL to
-				// confirm. The list is untouched, so this write still self-heals a
-				// deleted map; only the incoming snapshot is withheld.
+			added, removed, accepted := b.applyFull(sr.New)
+			if !accepted {
+				// lastFull is not advanced, so the next tick asks for another snapshot
+				// instead of waiting a whole RESYNC_INTERVAL to confirm. The list is
+				// already rolled back, so this write still self-heals a deleted map.
 				b.metrics.resyncRefused.Add(1)
-				log.Printf("WARNING: resync returned %d decisions against %d held - refusing to unban that much on a single snapshot; keeping the current list and re-checking on the next poll",
-					len(sr.New), b.decisionCount())
+				log.Printf("WARNING: resync would have removed %d IPs and added %d, against %s held - refusing to unban that much on a single snapshot; keeping the current list and re-checking on the next poll",
+					removed, added, b.totals())
 				if err := b.write(); err != nil {
 					log.Printf("write failed: %v", err)
 				}
@@ -146,7 +167,6 @@ func (b *bouncer) run(ctx context.Context) {
 			}
 			lastFull = time.Now()
 			b.metrics.resyncsOK.Add(1)
-			added, removed := b.applyFull(sr.New)
 			// always rewrite on resync (self-heals an externally deleted file)
 			if err := b.write(); err != nil {
 				log.Printf("write failed: %v", err)

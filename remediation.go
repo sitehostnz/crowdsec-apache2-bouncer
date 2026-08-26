@@ -151,19 +151,37 @@ func (r *remediation) rebuildSorted() {
 	slices.Sort(r.sortedIPs)
 }
 
-// reset empties the set for a full snapshot and returns the refcount map it
-// replaced, for diff to compare against. The previous size is the better
-// estimate of the next one on a resync; on a cold start there is none, so one IP
-// per decision is the floor.
-func (r *remediation) reset(decisions int) (before map[string]int) {
-	before = r.refcount
-	size := len(before)
+// remediationState is the pair of maps a full snapshot displaces, kept for the
+// duration of the apply so a refused snapshot can be put back; see applyFull.
+//
+// sortedIPs is not part of it: rebuildSorted reuses that slice's backing array, so a
+// stashed copy would alias the rebuilt one. restore regenerates it from refcount.
+type remediationState struct {
+	decisionIPs map[string][]string
+	refcount    map[string]int
+}
+
+// reset empties the set for a full snapshot and returns the state it replaced,
+// for diff to compare against and restore to put back. The previous size is the
+// better estimate of the next one on a resync; on a cold start there is none, so
+// one IP per decision is the floor.
+func (r *remediation) reset(decisions int) (before remediationState) {
+	before = remediationState{decisionIPs: r.decisionIPs, refcount: r.refcount}
+	size := len(before.refcount)
 	if size == 0 {
 		size = decisions
 	}
 	r.decisionIPs = make(map[string][]string, len(r.decisionIPs))
 	r.refcount = make(map[string]int, size)
 	return before
+}
+
+// restore puts back the state reset displaced, undoing a full snapshot that was
+// applied and then refused.
+func (r *remediation) restore(before remediationState) {
+	r.decisionIPs = before.decisionIPs
+	r.refcount = before.refcount
+	r.rebuildSorted()
 }
 
 // diff reports how the set changed against the refcount map it replaced. Decision
