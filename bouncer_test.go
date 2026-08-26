@@ -316,7 +316,7 @@ func TestEachRemediationGetsItsOwnFiles(t *testing.T) {
 
 func TestRefcountOverlapAndDelta(t *testing.T) {
 	b := testBouncer(t, nil)
-	added, removed := b.applyFull([]decision{
+	added, removed, _ := b.applyFull([]decision{
 		dec("1", "Ip", "203.0.113.9", "ban"),
 		dec("2", "Range", "10.0.0.0/30", "ban"),
 	})
@@ -386,7 +386,7 @@ func TestApplyFullReportsResyncDiff(t *testing.T) {
 		dec("2", "Ip", "198.51.100.1", "ban"),
 	})
 	// resync: one kept, one gone, one new -> +1/-1
-	added, removed := b.applyFull([]decision{
+	added, removed, _ := b.applyFull([]decision{
 		dec("1", "Ip", "203.0.113.9", "ban"),
 		dec("3", "Ip", "192.0.2.3", "ban"),
 	})
@@ -662,59 +662,175 @@ func TestEndToEndFileMaintenance(t *testing.T) {
 
 // ---- full-snapshot shrink guard ------------------------------------------------
 
-// A full snapshot replaces the list wholesale, so a truncated-but-valid 200 would
-// unban everything it omits. A large drop has to be confirmed by a second snapshot.
+// A short snapshot would unban everything it omits, so a large drop has to be
+// confirmed by a second one. Both counts are IPs, not decisions; see minSnapshotIPs.
 func TestAcceptSnapshot(t *testing.T) {
-	held := func(n int) *bouncer {
-		b := testBouncer(t, nil)
-		for i := range n {
-			banSet(b).decisionIPs[strconv.Itoa(i)] = []string{"203.0.113.1"}
-		}
-		return b
-	}
-
 	t.Run("a small list is never second-guessed", func(t *testing.T) {
-		b := held(minSnapshotDecisions - 1)
-		if !b.acceptSnapshot(0) {
+		b := testBouncer(t, nil)
+		if !b.acceptSnapshot(minSnapshotIPs-1, 0) {
 			t.Fatal("below the floor a snapshot must be taken at face value")
 		}
 	})
 
 	t.Run("a modest shrink is accepted outright", func(t *testing.T) {
-		b := held(1000)
-		if !b.acceptSnapshot(600) {
+		b := testBouncer(t, nil)
+		if !b.acceptSnapshot(1000, 600) {
 			t.Fatal("600 of 1000 is above the limit and should apply immediately")
 		}
 	})
 
+	t.Run("exactly half is above the limit", func(t *testing.T) {
+		b := testBouncer(t, nil)
+		if !b.acceptSnapshot(1000, 500) {
+			t.Fatal("the limit is fewer than half, so half itself must apply")
+		}
+	})
+
 	t.Run("growth is always accepted", func(t *testing.T) {
-		b := held(1000)
-		if !b.acceptSnapshot(5000) {
+		b := testBouncer(t, nil)
+		if !b.acceptSnapshot(1000, 5000) {
 			t.Fatal("a larger snapshot must apply")
 		}
 	})
 
 	t.Run("an empty snapshot is refused once then confirmed", func(t *testing.T) {
-		b := held(1000)
-		if b.acceptSnapshot(0) {
+		b := testBouncer(t, nil)
+		if b.acceptSnapshot(1000, 0) {
 			t.Fatal("a snapshot wiping the whole list must not apply on first sight")
 		}
-		if !b.acceptSnapshot(0) {
+		if !b.acceptSnapshot(1000, 0) {
 			t.Fatal("a second agreeing snapshot means the flush is real - it must apply")
 		}
 	})
 
 	t.Run("a recovered snapshot clears the pending state", func(t *testing.T) {
-		b := held(1000)
-		if b.acceptSnapshot(0) {
+		b := testBouncer(t, nil)
+		if b.acceptSnapshot(1000, 0) {
 			t.Fatal("first short snapshot should be refused")
 		}
-		if !b.acceptSnapshot(1000) { // LAPI recovered
+		if !b.acceptSnapshot(1000, 1000) { // LAPI recovered
 			t.Fatal("a full snapshot must apply")
 		}
 		// ...so the next short one starts the count again rather than landing.
-		if b.acceptSnapshot(0) {
+		if b.acceptSnapshot(1000, 0) {
 			t.Fatal("pending state should have been reset by the good snapshot")
 		}
 	})
+}
+
+// A refused snapshot has already been applied, so the rollback is what keeps the
+// current bans enforced. refcount alone is not enough: decisionIPs is what the next
+// delta deletes against, and sortedIPs is what gets written to the map.
+func TestRefusedSnapshotRollsBack(t *testing.T) {
+	b := testBouncer(t, nil)
+	// The /15 is 131072 addresses, over testBouncer's EXPAND_MAX_HOSTS of 65536, so it
+	// lands in skippedRanges rather than the map - the one restored field that is not a
+	// remediation member, and so the easiest to drop in a later refactor.
+	seed := append(ipDecisions(200, 0), dec("big", "Range", "10.128.0.0/15", "ban"))
+	if _, _, ok := b.applyFull(seed); !ok {
+		t.Fatal("the first snapshot has nothing to shrink from and must apply")
+	}
+	if b.skippedRanges != 1 {
+		t.Fatalf("seeded skippedRanges = %d, want 1", b.skippedRanges)
+	}
+	wantSorted := slices.Clone(banSet(b).sortedIPs)
+	wantDecisions := b.decisionCount()
+
+	added, removed, ok := b.applyFull(ipDecisions(10, 0))
+	if ok {
+		t.Fatal("a snapshot holding 10 of 200 IPs must be refused on first sight")
+	}
+	if added != 0 || removed != 190 {
+		t.Errorf("refused snapshot reported +%d/-%d, want +0/-190", added, removed)
+	}
+	if got := b.decisionCount(); got != wantDecisions {
+		t.Errorf("decisions after rollback = %d, want %d", got, wantDecisions)
+	}
+	if got := len(banSet(b).refcount); got != len(wantSorted) {
+		t.Errorf("refcount after rollback = %d IPs, want %d", got, len(wantSorted))
+	}
+	if got := banSet(b).sortedIPs; !slices.Equal(got, wantSorted) {
+		t.Errorf("sortedIPs after rollback = %d entries, want the %d held before", len(got), len(wantSorted))
+	}
+	if b.skippedRanges != 1 {
+		t.Errorf("skippedRanges after rollback = %d, want the 1 counted before", b.skippedRanges)
+	}
+	assertSortedInStep(t, b)
+
+	// A genuine flush must not be blocked forever: the second agreeing snapshot lands.
+	if _, _, ok := b.applyFull(ipDecisions(10, 0)); !ok {
+		t.Fatal("a second agreeing snapshot must apply")
+	}
+	if got := len(banSet(b).refcount); got != 10 {
+		t.Errorf("after the confirmed snapshot = %d IPs, want 10", got)
+	}
+}
+
+// The rollback walks b.remediations and before[] in parallel, and the guard sums
+// across every map. Neither is exercised by one map: a transposed index is
+// indistinguishable from a correct one, and there is nothing to sum.
+func TestRefusedSnapshotRollsBackEveryMap(t *testing.T) {
+	seeded := func(t *testing.T) (*bouncer, *remediation, *remediation) {
+		t.Helper()
+		b := testBouncer(t, func(c *config) { c.bouncingOnType = bouncingAll; c.captchaListen = "127.0.0.1:0" })
+		seed := append(ipDecisions(200, 0), dec("c1", "Range", "10.10.0.0/24", "captcha"))
+		if _, _, ok := b.applyFull(seed); !ok {
+			t.Fatal("the seeding snapshot must apply")
+		}
+		ban, captcha := b.setFor("ban"), b.setFor("captcha")
+		if len(ban.refcount) != 200 || len(captcha.refcount) != 256 {
+			t.Fatalf("seed = ban %d, captcha %d IPs; want 200 and 256", len(ban.refcount), len(captcha.refcount))
+		}
+		return b, ban, captcha
+	}
+
+	t.Run("a refusal restores every map, not only the one that shrank", func(t *testing.T) {
+		b, ban, captcha := seeded(t)
+		// 5 IPs against the 456 held across both maps, so this is refused - and the
+		// captcha map, which the snapshot merely omits, has to come back too.
+		if _, _, ok := b.applyFull(ipDecisions(5, 0)); ok {
+			t.Fatal("a snapshot holding 5 of 456 IPs must be refused on first sight")
+		}
+		if got := len(ban.refcount); got != 200 {
+			t.Errorf("ban map after rollback = %d IPs, want 200", got)
+		}
+		if got := len(captcha.refcount); got != 256 {
+			t.Errorf("captcha map after rollback = %d IPs, want 256", got)
+		}
+		assertSortedInStep(t, b)
+	})
+
+	t.Run("the guard sums across maps rather than judging each alone", func(t *testing.T) {
+		b, ban, captcha := seeded(t)
+		// The ban map collapses 200 -> 5 while captcha is untouched. 261 of 456 is
+		// above the limit so it applies, which is the design: judged on its own the ban
+		// map's 97% drop would have vetoed a snapshot that is fine overall.
+		short := append(ipDecisions(5, 0), dec("c1", "Range", "10.10.0.0/24", "captcha"))
+		if _, _, ok := b.applyFull(short); !ok {
+			t.Fatal("a snapshot holding 261 of 456 IPs must apply")
+		}
+		if len(ban.refcount) != 5 || len(captcha.refcount) != 256 {
+			t.Errorf("after the applied snapshot = ban %d, captcha %d IPs; want 5 and 256",
+				len(ban.refcount), len(captcha.refcount))
+		}
+	})
+}
+
+// The case the old decision-count guard got wrong. A handful of range decisions can
+// hold six figures of IPs, so comparing an incoming decision count against what was
+// held read a perfectly good snapshot as a collapse. Counting IPs on both sides is
+// what fixes it.
+func TestRangeHeavySnapshotIsNotRefused(t *testing.T) {
+	b := testBouncer(t, nil)
+	if _, _, ok := b.applyFull(ipDecisions(200, 0)); !ok {
+		t.Fatal("the seeding snapshot must apply")
+	}
+	// One decision, 256 IPs: fewer decisions than were held, but more IPs.
+	_, _, ok := b.applyFull([]decision{dec("1", "Range", "10.10.0.0/24", "ban")})
+	if !ok {
+		t.Fatal("a snapshot of 1 range decision covering 256 IPs is growth, not a shrink")
+	}
+	if got := len(banSet(b).refcount); got != 256 {
+		t.Errorf("after the range snapshot = %d IPs, want 256", got)
+	}
 }

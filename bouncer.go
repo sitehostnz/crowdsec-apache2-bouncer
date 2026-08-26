@@ -57,41 +57,50 @@ type bouncer struct {
 	metrics *metrics
 }
 
-// A full snapshot replaces the list wholesale, so one that arrives short unbans
-// everything it omits. A truncated-but-valid 200 is indistinguishable from a
-// genuine mass-unban at the point of decode - the LAPI can commit a 200 and start
-// writing JSON before it finishes reading its database - so a snapshot that would
-// drop most of the list is treated as suspect rather than authoritative.
+// A full snapshot replaces the list wholesale, so a short one unbans everything it
+// omits. A body cut mid-stream is caught by the decoder; an empty 200 is not, since
+// fetch maps it to "no changes" - on a resync that is a total unban.
+//
+// Counted in IPs, not decisions. CrowdSec re-issues the same IPs under fresh ids
+// without always streaming the retirement of the old ones, so a held decision count
+// can sit at twice the real one and refuse good snapshots for hours. IPs also keep
+// range-heavy lists safe: 100 range decisions covering 100k IPs is an ordinary
+// snapshot, not a 99.9% collapse.
 const (
-	// minSnapshotDecisions is the size below which the list is too small for a
-	// proportional test to mean anything: a handful of decisions can legitimately
-	// halve in one interval.
-	minSnapshotDecisions = 50
-	// snapshotShrinkDenom expresses the limit as a fraction: a snapshot holding
-	// fewer than 1/2 of the decisions currently held has to be confirmed.
+	// minSnapshotIPs is the size below which the list is too small for a
+	// proportional test to mean anything: a handful of IPs can legitimately halve
+	// in one interval.
+	minSnapshotIPs = 50
+	// snapshotShrinkDenom expresses the limit as a fraction: a snapshot listing
+	// fewer than 1/2 of the IPs currently held has to be confirmed.
 	snapshotShrinkDenom = 2
 )
 
-// acceptSnapshot reports whether a full snapshot should be allowed to replace the
-// current list. A big shrink is refused the first time and accepted only if the
-// next snapshot agrees, so a transient LAPI fault costs one resync interval of
-// staleness instead of unbanning everyone. A genuine flush still lands, one
-// interval later.
+// acceptSnapshot reports whether a freshly applied full snapshot should be kept. A
+// big shrink is refused once and accepted when the next snapshot also shrinks, so a
+// transient LAPI fault costs one poll of staleness rather than every ban. A genuine
+// flush lands one poll later.
 //
-// The test is across every remediation at once, because one snapshot carries all
-// of them: a response truncated mid-stream shortens whichever types it cut off,
-// and judging each map on its own would let a small one veto an otherwise good
-// snapshot.
-func (b *bouncer) acceptSnapshot(incoming int) bool {
-	held := b.decisionCount()
-	if held < minSnapshotDecisions || incoming*snapshotShrinkDenom >= held {
+// The two snapshots are never compared with each other, only against the same held
+// list, so two inconsistent short readings still confirm each other. This buys a
+// poll of confirmation, not a consistency proof.
+//
+// Both counts are summed across every remediation: one snapshot carries all of them,
+// and judging each map alone would let a small one veto a good snapshot. The summing
+// also means a map the snapshot omits wholesale is unprotected while the others hold.
+//
+// Measured on the resulting size, not on departures, because the threat is omission -
+// a truncated or empty body never adds. A list that rotates wholesale grows as much
+// as it drops and passes, where counting departures would stall it for a poll.
+func (b *bouncer) acceptSnapshot(heldIPs, snapshotIPs int) bool {
+	if heldIPs < minSnapshotIPs || snapshotIPs*snapshotShrinkDenom >= heldIPs {
 		b.pendingShrink = 0
 		return true
 	}
 	b.pendingShrink++
 	if b.pendingShrink >= 2 {
 		b.pendingShrink = 0
-		return true // a second snapshot agrees, so the drop is real
+		return true // a second short reading: the drop is real
 	}
 	return false
 }
@@ -248,28 +257,49 @@ func (b *bouncer) remove(d decision) {
 	}
 }
 
-// applyFull rebuilds every map from a full snapshot of decisions and returns the
-// net IPs added/removed versus before, summed across the maps. It diffs each
-// outgoing refcount map against its replacement directly - they are being
-// replaced anyway, so there is nothing to copy.
-func (b *bouncer) applyFull(newDecisions []decision) (added, removed int) {
+// applyFull rebuilds every map from a full snapshot of decisions and reports the
+// net IPs added/removed versus before, summed across the maps, plus whether the
+// result was kept. It diffs each outgoing refcount map against its replacement
+// directly - they are being replaced anyway, so there is nothing to copy.
+//
+// The guard runs after the apply because only the applied result gives a true IP
+// count. A refused snapshot is rolled back and accepted is false; added and removed
+// still describe what it would have done, for the caller to log.
+//
+// Costs of that ordering, all paid only on a resync: one wasted apply per refusal,
+// the displaced maps held until the diff is known (~16 MiB at 141k decisions), and
+// expand's skip lines logged twice - once for the rolled-back snapshot, once for the
+// confirming retry.
+func (b *bouncer) applyFull(newDecisions []decision) (added, removed int, accepted bool) {
 	b.state.Lock()
 	defer b.state.Unlock()
 
-	before := make([]map[string]int, len(b.remediations))
+	heldIPs := 0
+	before := make([]remediationState, len(b.remediations))
 	for i, r := range b.remediations {
+		heldIPs += len(r.refcount)
 		before[i] = r.reset(len(newDecisions))
 	}
+	skippedBefore := b.skippedRanges
 	b.skippedRanges = 0
 	for _, d := range newDecisions {
 		b.add(d)
 	}
+	snapshotIPs := 0
 	for i, r := range b.remediations {
 		r.rebuildSorted()
-		a, rm := r.diff(before[i])
+		a, rm := r.diff(before[i].refcount)
 		added, removed = added+a, removed+rm
+		snapshotIPs += len(r.refcount)
 	}
-	return added, removed
+	if !b.acceptSnapshot(heldIPs, snapshotIPs) {
+		for i, r := range b.remediations {
+			r.restore(before[i])
+		}
+		b.skippedRanges = skippedBefore
+		return added, removed, false
+	}
+	return added, removed, true
 }
 
 // applyDelta applies an incremental update (deleted decisions first, then new

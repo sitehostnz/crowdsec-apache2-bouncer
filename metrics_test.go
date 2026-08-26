@@ -97,13 +97,19 @@ func TestMetricsScrapeDuringApplyIsRaceFree(t *testing.T) {
 	// window sees a list that is momentarily near-empty. Covered separately because
 	// a future edit could drop the lock from applyFull alone and leave the delta
 	// path guarded - and the suite would stay green.
+	// Alternates a snapshot above minSnapshotIPs with a short one, so half the rounds
+	// are refused and the rollback - which writes the same maps the apply does - runs
+	// under the detector too. Below the floor the guard short-circuits and it never did.
 	go func() {
 		defer wg.Done()
+		big := append(ipDecisions(minSnapshotIPs+10, 0),
+			dec("full-b", "Range", "10.0.0.0/30", "captcha"))
 		for i := range rounds {
-			b.applyFull([]decision{
-				dec("full-a", "Ip", "198.51.100."+strconv.Itoa(i%256), "ban"),
-				dec("full-b", "Range", "10.0.0.0/30", "captcha"),
-			})
+			if i%2 == 0 {
+				b.applyFull(big)
+			} else {
+				b.applyFull([]decision{dec("full-a", "Ip", "198.51.100."+strconv.Itoa(i%256), "ban")})
+			}
 		}
 	}()
 
